@@ -37,7 +37,6 @@ GEMINI_MODELS_FALLBACK = (
     "gemini-2.5-pro",
 )
 
-# Справочник видов торгов Prozorro (без упоминания Постановления КМУ №1178)
 PROCUREMENT_METHODS = {
     "aboveThreshold": "Открытые торги с особенностями",
     "aboveThresholdUA": "Открытые торги",
@@ -48,18 +47,19 @@ PROCUREMENT_METHODS = {
     "belowThreshold": "Упрощенная / допороговая закупка"
 }
 
-# 2. HTTP-сессия с пулом соединений (настроена под 15 потоков и автоповтор)
+# 2. HTTP-сессия с пулом соединений
 http_session = requests.Session()
 retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
 adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retries)
 http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
 
-# 3. База данных проверенных тендеров и курсоров синхронизации
+# 3. База данных проверенных тендеров, курсоров и очереди гарантированного повтора (retry_queue)
 conn = sqlite3.connect("processed_tenders.db")
 cursor = conn.cursor()
 cursor.execute("CREATE TABLE IF NOT EXISTS tenders (id TEXT PRIMARY KEY)")
 cursor.execute("CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, val TEXT)")
+cursor.execute("CREATE TABLE IF NOT EXISTS retry_queue (id TEXT PRIMARY KEY)")
 conn.commit()
 
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -70,7 +70,16 @@ def is_already_processed(tender_id: str) -> bool:
 
 def mark_as_processed(tender_id: str):
     cursor.execute("INSERT OR IGNORE INTO tenders (id) VALUES (?)", (tender_id,))
+    cursor.execute("DELETE FROM retry_queue WHERE id = ?", (tender_id,))
     conn.commit()
+
+def add_to_retry_queue(tender_id: str):
+    cursor.execute("INSERT OR IGNORE INTO retry_queue (id) VALUES (?)", (tender_id,))
+    conn.commit()
+
+def get_retry_queue_ids() -> list:
+    cursor.execute("SELECT id FROM retry_queue")
+    return [r[0] for r in cursor.fetchall()]
 
 def get_sync_val(key: str) -> str:
     cursor.execute("SELECT val FROM sync_state WHERE key = ?", (key,))
@@ -103,7 +112,6 @@ def calculate_budget_with_vat_strict(tender_data: dict) -> str:
     ]
     target_items = fuel_items if fuel_items else items
 
-    # Если в закупке всего 1 позиция товара: (бюджет / количество) * 1.2
     if len(target_items) == 1:
         qty = float(target_items[0].get("quantity", 0) or 0)
         unit_raw = str(target_items[0].get("unit", {}).get("name", "ед.")).lower()
@@ -120,7 +128,6 @@ def calculate_budget_with_vat_strict(tender_data: dict) -> str:
             unit_price_with_vat = (budget_raw / qty) * 1.2
             return f"{unit_price_with_vat:,.2f} грн/{unit_label} с НДС".replace(",", " ")
 
-    # Если в закупке больше 1 позиции товара: бюджет * 1.2
     total_with_vat = budget_raw * 1.2
     return f"{total_with_vat:,.2f} грн с НДС".replace(",", " ")
 
@@ -235,7 +242,7 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
     return "\n\n".join(extracted_texts), pdf_parts
 
-# 8. Когнитивная юридическая и коммерческая экспертиза через Gemini 3.0 Flash
+# 8. Когнитивная экспертиза через Gemini 3.0 Flash (с защитой от 503 UNAVAILABLE и 429)
 def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: list) -> dict:
     val = tender_data.get("value", {})
     budget_amount = val.get("amount", 0)
@@ -343,18 +350,25 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
 
     last_err = None
     for model_name in GEMINI_MODELS_FALLBACK:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=gen_config
-            )
-            return json.loads(response.text)
-        except Exception as err:
-            last_err = err
-            if "404" in str(err) or "NOT_FOUND" in str(err):
-                continue
-            raise err
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=gen_config
+                )
+                return json.loads(response.text)
+            except Exception as err:
+                last_err = err
+                err_str = str(err)
+                # Если модель не найдена (404) — сразу переключаемся на следующую в списке
+                if "404" in err_str or "NOT_FOUND" in err_str:
+                    break
+                # Если временный пик нагрузки (503 UNAVAILABLE или 429) — ждем 4 секунды и повторяем
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    time.sleep(4 * (attempt + 1))
+                    continue
+                break
     raise last_err
 
 # 9. Сборка карточки из 12 пунктов и передача в Google Sheets CRM (17 колонок)
@@ -461,7 +475,7 @@ def fetch_tender_detail(t_id: str) -> dict:
             pass
     return {}
 
-# 11. Оценка активных тендеров (снижено до 15 параллельных потоков: max_workers=15)
+# 11. Оценка активных тендеров (max_workers=15 + сохранение в retry_queue при временных сбоях)
 def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
     matched_budget = 0
     matched_fuel_cpv = 0
@@ -474,6 +488,7 @@ def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
             tid = future_to_id[future]
             tender = future.result()
             if not tender:
+                add_to_retry_queue(tid)
                 continue
 
             status = tender.get("status", "")
@@ -521,11 +536,46 @@ def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
             mark_as_processed(t_id)
             mark_as_processed(tender_ua_id)
         except Exception as e:
-            print(f" -> Ошибка при анализе {tender_ua_id} (будет повторен в следующем цикле): {e}")
+            print(f" -> Ошибка при анализе {tender_ua_id} (добавлен в очередь гарантированного повтора): {e}")
+            add_to_retry_queue(t_id)
 
     return matched_budget, matched_fuel_cpv, sent_to_crm
 
-# 12. Главный цикл непрерывного мониторинга
+# 12. Одноразовая точечная допроверка дневного среза 20 октября (10:15 - 20:00), где в запуске #7 был лимит 429
+def recover_oct20_daytime_slice_if_needed() -> tuple[int, int, int, int]:
+    if get_sync_val("oct20_daytime_recovered") == "1":
+        return 0, 0, 0, 0
+
+    print("=== Допроверка дневного среза 20.10.2026 (включая UA-2026-10-20-011345-a и UA-2026-10-20-000609-a) ===")
+    # Стартуем с утра 20 октября (00:00) вверх по ленте до вечера 20 октября (20:30)
+    url = f"{PROZORRO_API_BASE}/tenders?offset=2026-10-20T00:00:00+03:00&limit=100&opt_fields=status"
+    candidate_ids = []
+    scanned = 0
+
+    for _ in range(220):
+        if not url:
+            break
+        resp = http_session.get(url, timeout=15).json()
+        data = resp.get("data", [])
+        if not data:
+            break
+        last_ts = data[-1].get("dateModified", "")
+        for item in data:
+            scanned += 1
+            tid = item.get("id")
+            st = item.get("status", "")
+            if st in ("active.enquiries", "active.tendering") and not is_already_processed(tid):
+                candidate_ids.append(tid)
+        if last_ts > "2026-10-20T20:30:00":
+            break
+        url = resp.get("next_page", {}).get("uri")
+
+    print(f"Найдено непроверенных активных карточек за 20.10.2026: {len(candidate_ids)}")
+    b, f, s = evaluate_active_tenders(candidate_ids)
+    set_sync_val("oct20_daytime_recovered", "1")
+    return scanned, len(candidate_ids), b, s
+
+# 13. Главный цикл непрерывного мониторинга
 def run_monitoring():
     total_scanned = 0
     total_active = 0
@@ -533,6 +583,17 @@ def run_monitoring():
     total_fuel = 0
     total_sent = 0
 
+    # Шаг 0: Проверка очереди отложенных из-за ошибки 503 тендеров
+    retry_ids = get_retry_queue_ids()
+    if retry_ids:
+        print(f"=== Повторная проверка отложенных тендеров из очереди retry_queue ({len(retry_ids)} шт.) ===")
+        rb, rf, rs = evaluate_active_tenders(retry_ids)
+        total_active += len(retry_ids)
+        total_budget += rb
+        total_fuel += rf
+        total_sent += rs
+
+    # Шаг 1: Проверка свежих изменений с вершины ленты Prozorro
     last_top_ts = get_sync_val("last_top_ts")
     new_top_ts = ""
     next_url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status"
@@ -584,57 +645,18 @@ def run_monitoring():
     total_fuel += f1
     total_sent += s1
 
-    # ФАЗА 2: Автоматическая докачка истории вглубь до 20.10.2026
-    backfill_done = get_sync_val("backfill_done_2026_10_20")
-    backfill_url = get_sync_val("backfill_next_url")
-
-    if not backfill_done and backfill_url:
-        print(f"=== ФАЗА 2: Докачка истории торгов вглубь до {BACKFILL_TARGET_ISO} ===")
-        backfill_active_ids = []
-        max_backfill_pages = 180
-
-        for b_page in range(1, max_backfill_pages + 1):
-            if not backfill_url:
-                set_sync_val("backfill_done_2026_10_20", "1")
-                break
-            resp = http_session.get(backfill_url, timeout=15).json()
-            items_list = resp.get("data", [])
-            if not items_list:
-                set_sync_val("backfill_done_2026_10_20", "1")
-                break
-
-            last_mod_in_batch = items_list[-1].get("dateModified", "")
-            for item in items_list:
-                total_scanned += 1
-                t_id = item.get("id")
-                status = item.get("status", "")
-                if status in ("active.enquiries", "active.tendering") and not is_already_processed(t_id):
-                    backfill_active_ids.append(t_id)
-
-            backfill_url = resp.get("next_page", {}).get("uri")
-            set_sync_val("backfill_next_url", backfill_url or "")
-
-            if b_page % 20 == 0:
-                print(f" -> Пройдено {b_page} стр. истории (текущая дата в ленте: {last_mod_in_batch[:16]})...")
-
-            if last_mod_in_batch < BACKFILL_TARGET_ISO:
-                print(f"Достигнута целевая дата истории ({BACKFILL_TARGET_ISO})! Историческая докачка завершена.")
-                set_sync_val("backfill_done_2026_10_20", "1")
-                break
-
-        print(f"Найдено активных тендеров в историческом срезе: {len(backfill_active_ids)}")
-        b2, f2, s2 = evaluate_active_tenders(backfill_active_ids)
-        total_active += len(backfill_active_ids)
-        total_budget += b2
-        total_fuel += f2
-        total_sent += s2
+    # Шаг 2: Одноразовая допроверка карточек за 20 октября (включая UA-2026-10-20-000609-a и КП "КИЇВПАСТРАНС")
+    sc2, ac2, b2, s2 = recover_oct20_daytime_slice_if_needed()
+    total_scanned += sc2
+    total_active += ac2
+    total_budget += b2
+    total_sent += s2
 
     print("=========================================")
     print("ИТОГИ ЦИКЛА МОНИТОРИНГА:")
     print(f"- Всего просмотрено записей в ленте: {total_scanned}")
     print(f"- Из них проверено активных карточек: {total_active}")
     print(f"- Активных тендеров с бюджетом >= 2.4 млн грн: {total_budget}")
-    print(f"- Из них по кодам топлива (0913...): {total_fuel}")
     print(f"- Подтверждено наливом и отправлено в Telegram: {total_sent}")
     print("=========================================")
 
