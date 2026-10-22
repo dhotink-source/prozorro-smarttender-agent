@@ -2,11 +2,9 @@ name: Prozorro SmartTender Fuel Agent
 
 on:
   schedule:
-    # Автоматический запуск каждые 30 минут 24/7
     - cron: '*/30 * * * *'
   workflow_dispatch:
 
-# Защита от одновременного наложения двух запусков друг на друга
 concurrency:
   group: prozorro-fuel-monitor
   cancel-in-progress: false
@@ -27,7 +25,9 @@ jobs:
           python-version: '3.11'
 
       - name: 3. Установка необходимых библиотек
-        run: pip install -r requirements.txt
+        run: |
+          sudo apt-get update && sudo apt-get install -y antiword
+          pip install -r requirements.txt
 
       - name: 4. Запуск анализа Prozorro и отправки в SmartTender CRM
         env:
