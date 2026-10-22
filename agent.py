@@ -27,7 +27,6 @@ PROZORRO_API_BASE = "https://public-api.prozorro.gov.ua/api/2.5"
 MIN_AMOUNT_UAH = 2400000
 TARGET_CPV_PREFIXES = ("09130000", "09132000", "09134200")
 
-# Дата начала глубокого ретроспективного поиска (20 октября 2026)
 BACKFILL_TARGET_ISO = "2026-10-20T00:00:00"
 
 GEMINI_MODELS_FALLBACK = (
@@ -54,7 +53,7 @@ adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retries)
 http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
 
-# 3. База данных проверенных тендеров, курсоров и очереди гарантированного повтора (retry_queue)
+# 3. База данных проверенных тендеров, курсоров и очереди гарантированного повтора
 conn = sqlite3.connect("processed_tenders.db")
 cursor = conn.cursor()
 cursor.execute("CREATE TABLE IF NOT EXISTS tenders (id TEXT PRIMARY KEY)")
@@ -101,7 +100,35 @@ def build_smarttender_url(tender_ua_id: str) -> str:
         pass
     return gateway_url
 
-# 5. Строгий математический расчет для Пункта 4 (ТОЛЬКО с НДС по формуле * 1.2)
+# 5. Форматирование даты и времени для Пункта 7 строго в формат: "ЧЧ:ММ, ДД-ММ-ГГГГ"
+def format_deadline_strict(iso_str: str) -> str:
+    if not iso_str:
+        return "Не указан"
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2})", str(iso_str))
+    if m:
+        year, month, day, time_hm = m.group(1), m.group(2), m.group(3), m.group(4)
+        return f"{time_hm}, {day}-{month}-{year}"
+    return str(iso_str)[:16].replace("T", " ")
+
+# 6. Гарантированное указание источника при ссылке на пункты: "(п. 4.1)" -> "(п. 4.1 Договора)"
+def enforce_clause_source(text: str, default_source: str = "Договора") -> str:
+    if not text:
+        return ""
+    # Если в скобках указан только номер пункта без названия документа, например (п. 4.1) или (п. 5.1, 5.2),
+    # автоматически дописываем название документа-источника
+    pattern = re.compile(r"\((п\.?\s*[\d\.,\s\-а-яіїєґА-ЯІЇЄҐ]+)\)")
+    source_keywords = ("догов", "контракт", "тд", "документац", "додат", "прилож", "специф", "оголош", "закон", "постанов")
+
+    def replacer(match):
+        inner = match.group(1).strip()
+        low_inner = inner.lower()
+        if any(k in low_inner for k in source_keywords):
+            return f"({inner})"
+        return f"({inner} {default_source})"
+
+    return pattern.sub(replacer, text)
+
+# 7. Строгий математический расчет для Пункта 4 (ТОЛЬКО с НДС по формуле * 1.2)
 def calculate_budget_with_vat_strict(tender_data: dict) -> str:
     budget_raw = float(tender_data.get("value", {}).get("amount", 0) or 0)
     items = tender_data.get("items", [])
@@ -131,7 +158,7 @@ def calculate_budget_with_vat_strict(tender_data: dict) -> str:
     total_with_vat = budget_raw * 1.2
     return f"{total_with_vat:,.2f} грн с НДС".replace(",", " ")
 
-# 6. Чтение файлов .docx и старых файлов .doc (Word 97-2003)
+# 8. Чтение файлов .docx и старых файлов .doc (Word 97-2003)
 def parse_docx_bytes(file_bytes: bytes, filename: str) -> str:
     try:
         doc = docx.Document(io.BytesIO(file_bytes))
@@ -168,7 +195,7 @@ def parse_old_doc_bytes(file_bytes: bytes, filename: str) -> str:
         pass
     return ""
 
-# 7. Выгрузка актуальных редакций всех вложений (.docx, .doc, .pdf, .zip)
+# 9. Выгрузка актуальных редакций всех вложений (.docx, .doc, .pdf, .zip)
 def extract_all_attachments(documents_json: list) -> tuple[str, list]:
     latest_docs = {}
     for d in documents_json:
@@ -242,7 +269,7 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
     return "\n\n".join(extracted_texts), pdf_parts
 
-# 8. Когнитивная экспертиза через Gemini 3.0 Flash (с защитой от 503 UNAVAILABLE и 429)
+# 10. Когнитивная экспертиза через Gemini 3.0 Flash
 def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: list) -> dict:
     val = tender_data.get("value", {})
     budget_amount = val.get("amount", 0)
@@ -281,7 +308,10 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
             "2. ВАЖНО: Если основной предмет закупки — талоны, топливные карты, скретч-карты, бланки-разрешения или требуется наличие сети АЗС для заправки машин "
             "(даже если в договоре есть резервный пункт о наливе на случай остановки работы АЗС) — строго верни is_relevant = false!\n"
             "3. В поле subject_and_procedure НЕ указывай '(Постановление КМУ №1178)' — пиши только предмет закупки и чистый вид процедуры.\n"
-            "Все ответы формируй на русском языке (прямые цитаты из украинского договора приводи дословно в кавычках с указанием номера пункта договора)."
+            "4. ОБЯЗАТЕЛЬНОЕ ПРАВИЛО ССЫЛОК НА ПУНКТЫ: Везде, где ты указываешь привязку условия к определенному пункту, "
+            "СТРОГО ОБЯЗАТЕЛЬНО указывай не только номер пункта, но и точный источник (например: '(п. 4.1 Договора)', '(п. 3.2 Тендерной документации)', '(п. 2 Приложения 3 к ТД)'). "
+            "Категорически запрещено писать просто '(п. 4.1)' без слова 'Договора' или 'Тендерной документации'!\n"
+            "Все ответы формируй на русском языке (прямые цитаты из украинского договора приводи дословно в кавычках с указанием номера пункта и источника)."
         ),
         response_mime_type="application/json",
         response_schema={
@@ -298,7 +328,7 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                 },
                 "payment_terms": {
                     "type": "STRING",
-                    "description": "Пункт 5: Условия оплаты (отсрочка в банковских/календарных днях, по факту поставки или предоплата)"
+                    "description": "Пункт 5: Условия оплаты с обязательным указанием пункта и документа-источника, например: (п. 4.1 Договора)"
                 },
                 "is_formula_pricing": {
                     "type": "BOOLEAN",
@@ -306,35 +336,35 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                 },
                 "formula_details": {
                     "type": "STRING",
-                    "description": "Пункт 6: Если цена формульная — точная математическая формула и описание всех ее коэффициентов согласно договору. Если фиксированная — напиши 'Цена фиксированная'"
+                    "description": "Пункт 6: Если цена формульная — точная математическая формула и описание всех коэффициентов с указанием пункта и источника (например: п. 3.4 Договора). Если фиксированная — напиши 'Цена фиксированная'"
                 },
                 "delivery_mode_and_location": {
                     "type": "STRING",
-                    "description": "Пункт 8: Способ отгрузки (Автотранспорт / ЖД вагон-цистерны), базис Инкотермс и точный адрес передачи товара или ж/д станция назначения"
+                    "description": "Пункт 8: Способ отгрузки (Автотранспорт / ЖД вагон-цистерны), базис Инкотермс и точный адрес передачи товара с указанием пункта и источника (например: п. 5.2 Договора)"
                 },
                 "delivery_and_contract_term": {
                     "type": "STRING",
-                    "description": "Пункт 9: Срок поставки отдельной партии по заявке, общий период поставки и срок действия договора"
+                    "description": "Пункт 9: Срок поставки партии, общий период поставки и срок действия договора с указанием пунктов и источника (например: п. 5.1, 10.1 Договора)"
                 },
                 "bid_security_uah": {
                     "type": "STRING",
-                    "description": "Пункт 10: Обеспечение тендерного предложения — размер гарантии в сумме (грн), или 'Не требуется'"
+                    "description": "Пункт 10: Обеспечение тендерного предложения — размер гарантии в сумме (грн) с указанием пункта Тендерной документации, или 'Не требуется'"
                 },
                 "contract_security_details": {
                     "type": "STRING",
-                    "description": "Пункт 11: Обеспечение выполнения договора — вид обеспечения (гарантия / депозит на счет заказчика) и размер в % от суммы договора, или 'Не требуется'"
+                    "description": "Пункт 11: Обеспечение выполнения договора — вид обеспечения и размер в % от суммы договора с указанием пункта Договора/ТД, или 'Не требуется'"
                 },
                 "features_pitfalls_and_risks": {
                     "type": "STRING",
-                    "description": "Для кнопки 'Особенности тендера' (Блок 1): Подводные камни по договору, особенности приемки и риски убытков поставщика с номерами пунктов и прямыми цитатами"
+                    "description": "Для кнопки 'Особенности тендера' (Блок 1): Подводные камни, особенности приемки и риски убытков поставщика с номерами пунктов, источником (Договора / Тендерной документации) и прямыми цитатами"
                 },
                 "features_penalties": {
                     "type": "STRING",
-                    "description": "Для кнопки 'Особенности тендера' (Блок 2): Ответственность поставщика (штрафные санкции, пеня) — размер и за что вменяется, с номерами пунктов договора и прямыми цитатами"
+                    "description": "Для кнопки 'Особенности тендера' (Блок 2): Ответственность поставщика (штрафы, пеня) — размер и за что вменяется, с номерами пунктов, источником (Договора) и прямыми цитатами"
                 },
                 "features_price_increase_rules": {
                     "type": "STRING",
-                    "description": "Для кнопки 'Особенности тендера' (Блок 3): Условия повышения цены (на основании каких документов можно поднять цену, условия и ограничения) с номерами пунктов договора и прямыми цитатами"
+                    "description": "Для кнопки 'Особенности тендера' (Блок 3): Условия повышения цены (документы, условия, ограничения) с номерами пунктов, источником (Договора / Тендерной документации) и прямыми цитатами"
                 }
             },
             "required": [
@@ -361,17 +391,15 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
             except Exception as err:
                 last_err = err
                 err_str = str(err)
-                # Если модель не найдена (404) — сразу переключаемся на следующую в списке
                 if "404" in err_str or "NOT_FOUND" in err_str:
                     break
-                # Если временный пик нагрузки (503 UNAVAILABLE или 429) — ждем 4 секунды и повторяем
                 if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                     time.sleep(4 * (attempt + 1))
                     continue
                 break
     raise last_err
 
-# 9. Сборка карточки из 12 пунктов и передача в Google Sheets CRM (17 колонок)
+# 11. Сборка карточки из 12 пунктов и передача в Google Sheets CRM (17 колонок)
 def dispatch_to_crm(tender_data: dict, ai: dict):
     tender_ua_id = tender_data.get("tenderID", "Не указан")
     entity = tender_data.get("procuringEntity", {})
@@ -391,11 +419,25 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
 
     budget_display_str = calculate_budget_with_vat_strict(tender_data)
 
-    deadline = tender_data.get("tenderPeriod", {}).get("endDate", "Не указан")[:16].replace("T", " ")
+    # Пункт 7 в строгом формате: "время, дата-месяц-год" (например: 09:00, 23-10-2026)
+    raw_end_date = tender_data.get("tenderPeriod", {}).get("endDate", "")
+    deadline_formatted = format_deadline_strict(raw_end_date)
+
     tender_url = build_smarttender_url(tender_ua_id)
 
+    # Применяем контроль указания источника (Договора / Тендерной документации) ко всем полям со ссылками на пункты
+    payment_terms_clean = enforce_clause_source(ai.get("payment_terms", ""), "Договора")
+    delivery_loc_clean = enforce_clause_source(ai.get("delivery_mode_and_location", ""), "Договора")
+    delivery_term_clean = enforce_clause_source(ai.get("delivery_and_contract_term", ""), "Договора")
+    bid_sec_clean = enforce_clause_source(ai.get("bid_security_uah", ""), "Тендерной документации")
+    contract_sec_clean = enforce_clause_source(ai.get("contract_security_details", ""), "Договора")
+    formula_raw = enforce_clause_source(ai.get("formula_details", ""), "Договора")
+
+    pitfalls_clean = enforce_clause_source(ai.get("features_pitfalls_and_risks", ""), "Договора")
+    penalties_clean = enforce_clause_source(ai.get("features_penalties", ""), "Договора")
+    price_inc_clean = enforce_clause_source(ai.get("features_price_increase_rules", ""), "Договора")
+
     is_formula = bool(ai.get("is_formula_pricing"))
-    formula_raw = ai.get("formula_details", "")
     if is_formula:
         pricing_html = (
             f"Цена формульная (нажмите на спойлер ниже или кнопку под сообщением):\n"
@@ -404,21 +446,22 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     else:
         pricing_html = "Цена фиксированная"
 
+    # Пункт 1: БЕЗ слова "Заказчик", наименование заказчика выделено жирным шрифтом
     card_html = (
         f"<b>НОВЫЙ ТЕНДЕР (ПОСТАВКА НАЛИВОМ: АВТО / ЖД)</b>\n"
         f"<b>ID закупки:</b> <code>{html.escape(tender_ua_id)}</code>\n"
         f"-----------------------------------------\n"
-        f"<b>1) Заказчик:</b> {html.escape(customer_str)}\n\n"
+        f"<b>1) {html.escape(customer_str)}</b>\n\n"
         f"<b>2) Предмет закупки и вид торгов:</b> {html.escape(subject_and_proc)}\n\n"
         f"<b>3) Марка топлива и объем:</b> {html.escape(ai['fuel_grade_and_volume'])}\n\n"
         f"<b>4) Бюджет закупки:</b> {html.escape(budget_display_str)}\n\n"
-        f"<b>5) Условия оплаты:</b> {html.escape(ai['payment_terms'])}\n\n"
+        f"<b>5) Условия оплаты:</b> {html.escape(payment_terms_clean)}\n\n"
         f"<b>6) Ценообразование:</b> {pricing_html}\n\n"
-        f"<b>7) Срок подачи тендерного предложения:</b> до {html.escape(deadline)}\n\n"
-        f"<b>8) Условия поставки и адрес передачи товара (Авто / ЖД):</b> {html.escape(ai['delivery_mode_and_location'])}\n\n"
-        f"<b>9) Срок поставки и срок действия договора:</b> {html.escape(ai['delivery_and_contract_term'])}\n\n"
-        f"<b>10) Обеспечение тендерного предложения:</b> {html.escape(ai['bid_security_uah'])}\n\n"
-        f"<b>11) Обеспечение договора:</b> {html.escape(ai['contract_security_details'])}\n\n"
+        f"<b>7) Срок подачи тендерного предложения:</b> до {html.escape(deadline_formatted)}\n\n"
+        f"<b>8) Условия поставки и адрес передачи товара (Авто / ЖД):</b> {html.escape(delivery_loc_clean)}\n\n"
+        f"<b>9) Срок поставки и срок действия договора:</b> {html.escape(delivery_term_clean)}\n\n"
+        f"<b>10) Обеспечение тендерного предложения:</b> {html.escape(bid_sec_clean)}\n\n"
+        f"<b>11) Обеспечение договора:</b> {html.escape(contract_sec_clean)}\n\n"
         f"<b>12) Ссылка на тендер:</b> <a href=\"{html.escape(tender_url)}\">{html.escape(tender_url)}</a>\n"
         f"-----------------------------------------\n"
         f"<i>Ответьте (Reply) свободным текстом на это сообщение, чтобы ИИ внес вашу цену, статус или результат в таблицу.</i>"
@@ -426,11 +469,11 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
 
     features_detailed_text = (
         f"1. ПОДВОДНЫЕ КАМНИ, ПРИЕМКА И РИСКИ УБЫТКОВ ПОСТАВЩИКА:\n"
-        f"{ai['features_pitfalls_and_risks']}\n\n"
+        f"{pitfalls_clean}\n\n"
         f"2. ОТВЕТСТВЕННОСТЬ ПОСТАВЩИКА (ШТРАФНЫЕ САНКЦИИ И ПЕНЯ):\n"
-        f"{ai['features_penalties']}\n\n"
+        f"{penalties_clean}\n\n"
         f"3. УСЛОВИЯ И ОГРАНИЧЕНИЯ ДЛЯ ПОВЫШЕНИЯ ЦЕНЫ (ДОКУМЕНТЫ И ПУНКТЫ ДОГОВОРА):\n"
-        f"{ai['features_price_increase_rules']}"
+        f"{price_inc_clean}"
     )
 
     payload = {
@@ -443,13 +486,13 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
             "procedureType": procedure_clean,
             "budgetDisplay": budget_display_str,
             "fuelSummary": ai["fuel_grade_and_volume"],
-            "deliveryAndTerms": f"{ai['delivery_mode_and_location']} | Сроки: {ai['delivery_and_contract_term']}",
+            "deliveryAndTerms": f"{delivery_loc_clean} | Сроки: {delivery_term_clean}",
             "paymentAndGuarantees": (
-                f"Оплата: {ai['payment_terms']} | "
-                f"Тендерная гарантия: {ai['bid_security_uah']} | "
-                f"Обеспечение договора: {ai['contract_security_details']}"
+                f"Оплата: {payment_terms_clean} | "
+                f"Тендерная гарантия: {bid_sec_clean} | "
+                f"Обеспечение договора: {contract_sec_clean}"
             ),
-            "deadline": deadline,
+            "deadline": deadline_formatted,
             "tenderUrl": tender_url,
             "isFormula": is_formula,
             "formulaText": formula_raw,
@@ -461,7 +504,7 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     resp = http_session.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
     print(f" -> Ответ Google Таблицы: {resp.text[:120]}")
 
-# 10. Загрузка карточки тендера с защитой и автоповтором при коде 429
+# 12. Загрузка карточки тендера с защитой и автоповтором при коде 429
 def fetch_tender_detail(t_id: str) -> dict:
     for attempt in range(4):
         try:
@@ -475,7 +518,7 @@ def fetch_tender_detail(t_id: str) -> dict:
             pass
     return {}
 
-# 11. Оценка активных тендеров (max_workers=15 + сохранение в retry_queue при временных сбоях)
+# 13. Оценка активных тендеров (max_workers=15 + сохранение в retry_queue при временных сбоях)
 def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
     matched_budget = 0
     matched_fuel_cpv = 0
@@ -541,13 +584,12 @@ def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
 
     return matched_budget, matched_fuel_cpv, sent_to_crm
 
-# 12. Одноразовая точечная допроверка дневного среза 20 октября (10:15 - 20:00), где в запуске #7 был лимит 429
+# 14. Одноразовая точечная допроверка дневного среза 20 октября
 def recover_oct20_daytime_slice_if_needed() -> tuple[int, int, int, int]:
     if get_sync_val("oct20_daytime_recovered") == "1":
         return 0, 0, 0, 0
 
-    print("=== Допроверка дневного среза 20.10.2026 (включая UA-2026-10-20-011345-a и UA-2026-10-20-000609-a) ===")
-    # Стартуем с утра 20 октября (00:00) вверх по ленте до вечера 20 октября (20:30)
+    print("=== Допроверка дневного среза 20.10.2026 ===")
     url = f"{PROZORRO_API_BASE}/tenders?offset=2026-10-20T00:00:00+03:00&limit=100&opt_fields=status"
     candidate_ids = []
     scanned = 0
@@ -575,7 +617,7 @@ def recover_oct20_daytime_slice_if_needed() -> tuple[int, int, int, int]:
     set_sync_val("oct20_daytime_recovered", "1")
     return scanned, len(candidate_ids), b, s
 
-# 13. Главный цикл непрерывного мониторинга
+# 15. Главный цикл непрерывного мониторинга
 def run_monitoring():
     total_scanned = 0
     total_active = 0
@@ -583,7 +625,6 @@ def run_monitoring():
     total_fuel = 0
     total_sent = 0
 
-    # Шаг 0: Проверка очереди отложенных из-за ошибки 503 тендеров
     retry_ids = get_retry_queue_ids()
     if retry_ids:
         print(f"=== Повторная проверка отложенных тендеров из очереди retry_queue ({len(retry_ids)} шт.) ===")
@@ -593,7 +634,6 @@ def run_monitoring():
         total_fuel += rf
         total_sent += rs
 
-    # Шаг 1: Проверка свежих изменений с вершины ленты Prozorro
     last_top_ts = get_sync_val("last_top_ts")
     new_top_ts = ""
     next_url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status"
@@ -645,7 +685,6 @@ def run_monitoring():
     total_fuel += f1
     total_sent += s1
 
-    # Шаг 2: Одноразовая допроверка карточек за 20 октября (включая UA-2026-10-20-000609-a и КП "КИЇВПАСТРАНС")
     sc2, ac2, b2, s2 = recover_oct20_daytime_slice_if_needed()
     total_scanned += sc2
     total_active += ac2
