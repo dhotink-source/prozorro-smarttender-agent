@@ -5,7 +5,11 @@ import html
 import json
 import zipfile
 import sqlite3
+import subprocess
+import tempfile
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import docx
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google import genai
@@ -18,14 +22,17 @@ SECRET_BRIDGE_KEY = os.environ.get("SECRET_BRIDGE_KEY", "FUEL_TENDER_SECRET_2026
 
 PROZORRO_API_BASE = "https://public-api.prozorro.gov.ua/api/2.5"
 
-# Порог бюджета снижен до 2,4 млн грн (2 400 000 грн)
+# Порог бюджета: 2,4 млн грн (2 400 000 грн)
 MIN_AMOUNT_UAH = 2400000
 TARGET_CPV_PREFIXES = ("09130000", "09132000", "09134200")
 
-# Быстрый фильтр для отсева очевидных талонов, карт и бланков в заголовке
-STOP_WORDS_REGEX = re.compile(
-    r"(талон|скретч|паливн[іи]х?\s+карт|картк|бланк[іи]?в?-дозвол|через\s+мережу\s+азс|на\s+азс|заправк[аи]\s+на\s+азс)",
-    re.IGNORECASE
+# Дата начала глубокого ретроспективного поиска (захватывает все торги с 20 октября 2026)
+BACKFILL_TARGET_ISO = "2026-10-20T00:00:00"
+
+# Приоритетная проверка конкретных закупок (включая КП "КИЇВПАСТРАНС" и многолотовый тендер из лога #4)
+FORCE_CHECK_UA_IDS = (
+    "UA-2026-10-20-011345-a",
+    "UA-2026-10-22-006129-a",
 )
 
 # Справочник видов торгов Prozorro
@@ -36,13 +43,25 @@ PROCUREMENT_METHODS = {
     "priceQuotation": "Запрос ценовых предложений (Prozorro Market / ЗЦП)",
     "negotiation": "Переговорная процедура",
     "negotiation.quick": "Переговорная процедура (ускоренная)",
-    "belowThreshold": "Допороговая закупка"
+    "belowThreshold": "Допороговая / упрощенная закупка"
 }
 
-# 2. Локальная база данных проверенных тендеров
+# 2. Быстрая HTTP-сессия с постоянным пулом соединений (Keep-Alive)
+http_session = requests.Session()
+retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
+adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=retries)
+http_session.mount("https://", adapter)
+http_session.mount("http://", adapter)
+
+# 3. База данных проверенных тендеров и курсоров синхронизации
 conn = sqlite3.connect("processed_tenders.db")
 cursor = conn.cursor()
 cursor.execute("CREATE TABLE IF NOT EXISTS tenders (id TEXT PRIMARY KEY)")
+cursor.execute("CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, val TEXT)")
+conn.commit()
+
+# Удаляем из базы ошибочно отсеянный в запуске #4 многолотовый тендер, чтобы перепроверить его через ИИ
+cursor.execute("DELETE FROM tenders WHERE id IN ('UA-2026-10-22-006129-a', 'UA-2026-10-20-011345-a')")
 conn.commit()
 
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -55,18 +74,27 @@ def mark_as_processed(tender_id: str):
     cursor.execute("INSERT OR IGNORE INTO tenders (id) VALUES (?)", (tender_id,))
     conn.commit()
 
-# 3. Формирование прямой ссылки на закупку на площадке SmartTender.biz
+def get_sync_val(key: str) -> str:
+    cursor.execute("SELECT val FROM sync_state WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    return row[0] if row else ""
+
+def set_sync_val(key: str, val: str):
+    cursor.execute("INSERT OR REPLACE INTO sync_state (key, val) VALUES (?, ?)", (key, val))
+    conn.commit()
+
+# 4. Формирование прямой ссылки на закупку на площадке SmartTender.biz
 def build_smarttender_url(tender_ua_id: str) -> str:
     gateway_url = f"https://smarttender.biz/government/details/{tender_ua_id}"
     try:
-        resp = requests.head(gateway_url, allow_redirects=True, timeout=8)
+        resp = http_session.head(gateway_url, allow_redirects=True, timeout=8)
         if resp.status_code == 200 and "smarttender.biz" in resp.url:
             return resp.url
     except Exception:
         pass
     return gateway_url
 
-# 4. Чтение файлов .docx (абзацы + таблицы без дублирования объединенных ячеек)
+# 5. Чтение файлов .docx и старых файлов .doc (Word 97-2003)
 def parse_docx_bytes(file_bytes: bytes, filename: str) -> str:
     try:
         doc = docx.Document(io.BytesIO(file_bytes))
@@ -91,11 +119,24 @@ def parse_docx_bytes(file_bytes: bytes, filename: str) -> str:
     except Exception as e:
         return f"Ошибка чтения DOCX {filename}: {e}"
 
-# 5. Выгрузка актуальных редакций файлов ТД и проекта договора (.docx, .pdf, .zip)
+def parse_old_doc_bytes(file_bytes: bytes, filename: str) -> str:
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".doc", delete=True) as tmp:
+            tmp.write(file_bytes)
+            tmp.flush()
+            res = subprocess.run(["antiword", tmp.name], capture_output=True, text=True, timeout=10)
+            if res.returncode == 0 and res.stdout.strip():
+                return f"=== ДОКУМЕНТ (DOC): {filename} ===\n" + res.stdout[:45000]
+    except Exception:
+        pass
+    return ""
+
+# 6. Выгрузка актуальных редакций всех вложений (включая документы лотов и позиций)
 def extract_all_attachments(documents_json: list) -> tuple[str, list]:
     latest_docs = {}
     for d in documents_json:
-        if d.get("documentOf") != "tender":
+        # Учитываем документы и всего тендера, и отдельных лотов/позиций
+        if d.get("documentOf") not in ("tender", "lot", "item"):
             continue
         doc_id = d.get("id")
         if not doc_id:
@@ -121,14 +162,14 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
     extracted_texts = []
     pdf_parts = []
 
-    for d in valid_docs[:7]:
+    for d in valid_docs[:8]:
         title = d.get("title", "document")
         url = d.get("url", "")
         if not url:
             continue
 
         try:
-            resp = requests.get(url, timeout=25)
+            resp = http_session.get(url, timeout=25)
             if resp.status_code != 200:
                 continue
             content = resp.content
@@ -136,19 +177,27 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
             if low_title.endswith(".docx"):
                 extracted_texts.append(parse_docx_bytes(content, title))
+            elif low_title.endswith(".doc"):
+                doc_txt = parse_old_doc_bytes(content, title)
+                if doc_txt:
+                    extracted_texts.append(doc_txt)
             elif low_title.endswith(".pdf"):
                 if len(content) < 15 * 1024 * 1024 and len(pdf_parts) < 3:
                     pdf_parts.append(types.Part.from_bytes(data=content, mime_type="application/pdf"))
                     extracted_texts.append(f"[Прикреплен PDF-документ: {title}]")
             elif low_title.endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(content)) as zf:
-                    for inner_name in zf.namelist()[:7]:
+                    for inner_name in zf.namelist()[:8]:
                         low_inner = inner_name.lower()
                         if low_inner.endswith((".p7s", ".sig")):
                             continue
                         inner_bytes = zf.read(inner_name)
                         if low_inner.endswith(".docx"):
                             extracted_texts.append(parse_docx_bytes(inner_bytes, f"{title}/{inner_name}"))
+                        elif low_inner.endswith(".doc"):
+                            doc_txt = parse_old_doc_bytes(inner_bytes, f"{title}/{inner_name}")
+                            if doc_txt:
+                                extracted_texts.append(doc_txt)
                         elif low_inner.endswith(".pdf") and len(inner_bytes) < 15 * 1024 * 1024 and len(pdf_parts) < 3:
                             pdf_parts.append(types.Part.from_bytes(data=inner_bytes, mime_type="application/pdf"))
                             extracted_texts.append(f"[Прикреплен PDF из архива: {inner_name}]")
@@ -157,7 +206,7 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
     return "\n\n".join(extracted_texts), pdf_parts
 
-# 6. Глубокая юридическая и коммерческая экспертиза тендера через Gemini 2.5 Flash
+# 7. Когнитивная юридическая и коммерческая экспертиза через Gemini 2.5 Flash
 def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: list) -> dict:
     val = tender_data.get("value", {})
     budget_amount = val.get("amount", 0)
@@ -165,16 +214,22 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
     guarantee_amount = tender_data.get("guarantee", {}).get("amount", 0)
     method_type = tender_data.get("procurementMethodType", "")
     method_readable = PROCUREMENT_METHODS.get(method_type, method_type)
+    
     items_json = json.dumps(tender_data.get("items", []), ensure_ascii=False)
+    lots_json = json.dumps(tender_data.get("lots", []), ensure_ascii=False)
+    milestones_json = json.dumps(tender_data.get("milestones", []), ensure_ascii=False)
 
     prompt = f"""
     ПАСПОРТ ЗАКУПКИ ИЗ PROZORRO:
+    ID закупки: {tender_data.get('tenderID', '')}
     Заголовок: {tender_data.get('title', '')}
     Описание: {tender_data.get('description', '')}
     Вид процедуры в системе: {method_readable} ({method_type})
-    Бюджет закупки: {budget_amount} UAH ({'с НДС' if vat_included else 'без НДС'})
+    Общий бюджет закупки: {budget_amount} UAH ({'с НДС' if vat_included else 'без НДС'})
     Тендерное обеспечение в паспорте Prozorro: {guarantee_amount} UAH
+    Лоты (если многолотовая закупка): {lots_json}
     Номенклатура и объемы (items): {items_json}
+    Электронные условия оплаты и поставки (milestones): {milestones_json}
 
     ПОЛНЫЙ ТЕКСТ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ И ПРОЕКТА ДОГОВОРА:
     {docs_text[:95000]}
@@ -188,11 +243,15 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
         config=types.GenerateContentConfig(
             system_instruction=(
                 "Ты — ведущий тендерный юрист и аналитик оптового поставщика нефтепродуктов в Украине. "
-                "Проанализируй тендерную документацию и проект договора. "
-                "КРИТЕРИЙ ОТБОРА (is_relevant = true): Закупается дизельное топливо или бензины НАЛИВОМ — "
-                "как АВТОМОБИЛЬНЫМ ТРАНСПОРТОМ (бензовозами/автоцистернами в резервуары заказчика или самовывозом автоцистернами заказчика), "
-                "так и ЖЕЛЕЗНОДОРОЖНЫМ ТРАНСПОРТОМ (железнодорожными вагон-цистернами на станцию назначения). "
-                "Если закупаются талоны, топливные карты, скретч-карты, бланки-разрешения или розничная заправка через АЗС — строго верни is_relevant = false. "
+                "Проанализируй паспорт закупки (включая Запит ціни пропозицій / Prozorro Market и Открытые торги), "
+                "электронные поля milestones/items/lots и прикрепленный проект договора/ТД.\n"
+                "КРИТЕРИЙ ОТБОРА (is_relevant = true):\n"
+                "1. Закупается дизельное топливо или бензины НАЛИВОМ — как АВТОМОБИЛЬНЫМ ТРАНСПОРТОМ "
+                "(бензовозами/автоцистернами в резервуары заказчика или самовывозом), так и ЖЕЛЕЗНОДОРОЖНЫМ ТРАНСПОРТОМ (вагон-цистернами).\n"
+                "2. ВАЖНО ДЛЯ МНОГОЛОТОВЫХ ТЕНДЕРОВ: Если в закупке несколько лотов, и хотя бы в одном лоте закупается дизельное топливо "
+                "или бензин НАЛИВОМ — обязательно верни is_relevant = true (и опиши именно наливные лоты)!\n"
+                "3. Верни is_relevant = false ТОЛЬКО в том случае, если во всех лотах закупаются исключительно талоны, топливные карты, "
+                "скретч-карты, бланки-разрешения или розничная заправка через сеть АЗС (либо не закупается ДТ/бензин).\n"
                 "Все ответы формируй на русском языке (прямые цитаты из украинского договора приводи дословно в кавычках с указанием номера пункта договора)."
             ),
             response_mime_type="application/json",
@@ -210,7 +269,7 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                     },
                     "unit_price_calculation": {
                         "type": "STRING",
-                        "description": "Пункт 4: Расчетная предельная цена за 1 единицу (литр/тонну/кг) с НДС исходя из бюджета закупки и объема"
+                        "description": "Пункт 4: Расчетная предельная цена за 1 единицу (литр/тонну/кг) с НДС (и без НДС, если бюджет указан без НДС) исходя из бюджета и объема"
                     },
                     "payment_terms": {
                         "type": "STRING",
@@ -230,15 +289,15 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                     },
                     "delivery_and_contract_term": {
                         "type": "STRING",
-                        "description": "Пункт 9: Срок поставки отдельной партии по заявке, общий период поставки и срок действия договора"
+                        "description": "Пункт 9: Срок поставки отдельной партии по заявке (например, в течение 5 календарных дней), общий период поставки и срок действия договора"
                     },
                     "bid_security_uah": {
                         "type": "STRING",
-                        "description": "Пункт 10: Обеспечение тендерного предложения — точный размер гарантии в сумме (грн)"
+                        "description": "Пункт 10: Обеспечение тендерного предложения — размер гарантии в сумме (грн), или 'Не требуется'"
                     },
                     "contract_security_details": {
                         "type": "STRING",
-                        "description": "Пункт 11: Обеспечение выполнения договора — вид обеспечения (гарантия / депозит) и размер в % от суммы договора"
+                        "description": "Пункт 11: Обеспечение выполнения договора — вид обеспечения (гарантия / депозит на счет заказчика) и размер в % от суммы договора, или 'Не требуется'"
                     },
                     "features_pitfalls_and_risks": {
                         "type": "STRING",
@@ -266,7 +325,7 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
     )
     return json.loads(response.text)
 
-# 7. Сборка карточки из 12 пунктов и передача в Google Sheets CRM
+# 8. Сборка карточки из 12 пунктов и передача в Google Sheets CRM
 def dispatch_to_crm(tender_data: dict, ai: dict):
     tender_ua_id = tender_data.get("tenderID", "Не указан")
     entity = tender_data.get("procuringEntity", {})
@@ -275,7 +334,7 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     customer_str = f"{cust_name} (ЕГРПОУ: {cust_edrpou})"
 
     val = tender_data.get("value", {})
-    budget_num = val.get("amount", 0)
+    budget_num = float(val.get("amount", 0) or 0)
     vat_str = "с НДС" if val.get("valueAddedTaxIncluded", True) else "без НДС"
     budget_full_str = f"{budget_num:,.2f} грн ({vat_str}) | Расчет за ед.: {ai['unit_price_calculation']}"
 
@@ -344,61 +403,40 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
         }
     }
 
-    resp = requests.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
+    resp = http_session.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
     print(f" -> Ответ Google Таблицы: {resp.text[:120]}")
 
-# Вспомогательная функция параллельной загрузки полной карточки тендера
+# Загрузка полной карточки тендера
 def fetch_tender_detail(t_id: str) -> dict:
     try:
-        r = requests.get(f"{PROZORRO_API_BASE}/tenders/{t_id}", timeout=12)
+        r = http_session.get(f"{PROZORRO_API_BASE}/tenders/{t_id}", timeout=12)
         if r.status_code == 200:
             return r.json().get("data", {})
     except Exception:
         pass
     return {}
 
-# 8. Главный цикл мониторинга Prozorro
-def run_monitoring():
-    next_url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status"
-    pages_to_scan = 20  # Просматриваем 2000 последних тендеров в ленте
-
-    total_scanned = 0
-    active_candidates = []
-
-    # Шаг 1: Быстрый сбор всех активных тендеров из ленты
-    for page in range(1, pages_to_scan + 1):
-        if not next_url:
-            break
-        print(f"Чтение страницы {page}/{pages_to_scan} ленты Prozorro...")
-        resp = requests.get(next_url, timeout=15).json()
-        items_list = resp.get("data", [])
-        next_url = resp.get("next_page", {}).get("uri")
-
-        for item in items_list:
-            total_scanned += 1
-            t_id = item.get("id")
-            status = item.get("status", "")
-
-            if status in ("active.enquiries", "active.tendering") and not is_already_processed(t_id):
-                active_candidates.append(t_id)
-
-    print(f"Найдено новых активных тендеров для проверки карточек: {len(active_candidates)}")
-
+# Обработка списка карточек: фильтрация бюджета >= 2.4 млн и кодов ДК 0913... + запуск Gemini
+def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
     matched_budget = 0
     matched_fuel_cpv = 0
     sent_to_crm = 0
     fuel_tenders_to_analyze = []
 
-    # Шаг 2: Многопоточная загрузка карточек активных тендеров (проверка бюджета >= 2.4 млн и кода ДК)
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_id = {executor.submit(fetch_tender_detail, tid): tid for tid in active_candidates}
+    with ThreadPoolExecutor(max_workers=35) as executor:
+        future_to_id = {executor.submit(fetch_tender_detail, tid): tid for tid in active_ids}
         for future in as_completed(future_to_id):
             tid = future_to_id[future]
             tender = future.result()
             if not tender:
                 continue
 
-            # Извлекаем точный бюджет из полной карточки тендера
+            ua_id = tender.get("tenderID", tid)
+            status = tender.get("status", "")
+            if status not in ("active.enquiries", "active.tendering"):
+                mark_as_processed(tid)
+                continue
+
             amount = float(tender.get("value", {}).get("amount", 0) or 0)
             if amount < MIN_AMOUNT_UAH:
                 mark_as_processed(tid)
@@ -406,7 +444,6 @@ def run_monitoring():
 
             matched_budget += 1
 
-            # Проверяем коды ДК 021:2015 (09130000, 09132000, 09134200)
             items = tender.get("items", [])
             has_fuel_cpv = any(
                 str(i.get("classification", {}).get("id", "")).startswith(TARGET_CPV_PREFIXES)
@@ -419,40 +456,144 @@ def run_monitoring():
             matched_fuel_cpv += 1
             fuel_tenders_to_analyze.append(tender)
 
-    # Шаг 3: Глубокий анализ найденных топливных тендеров через Gemini API
     for tender in fuel_tenders_to_analyze:
         t_id = tender["id"]
         tender_ua_id = tender.get("tenderID", t_id)
         amount = float(tender.get("value", {}).get("amount", 0) or 0)
-        full_title = f"{tender.get('title', '')} {tender.get('description', '')}"
+        print(f"Топливный тендер >= 2.4 млн: {tender_ua_id} | {amount:,.2f} грн | {tender.get('title', '')[:70]}")
 
-        print(f"Топливный тендер >= 2.4 млн: {tender_ua_id} | {amount:,.2f} грн | {tender.get('title', '')[:65]}")
+        try:
+            print(f" -> Скачивание документации и экспертиза Gemini для {tender_ua_id}...")
+            docs_text, pdf_parts = extract_all_attachments(tender.get("documents", []))
+            ai_verdict = analyze_tender_with_gemini(tender, docs_text, pdf_parts)
 
-        if STOP_WORDS_REGEX.search(full_title):
-            print(f" -> Отсеян по стоп-словам (талоны/карты/АЗС) в заголовке: {tender_ua_id}")
+            if ai_verdict.get("is_relevant"):
+                print(f" -> ПОДТВЕРЖДЕН НАЛИВ! Отправка в Google Sheets и Telegram: {tender_ua_id}")
+                dispatch_to_crm(tender, ai_verdict)
+                sent_to_crm += 1
+            else:
+                print(f" -> Отклонен ИИ после чтения ТД (только талоны/карты/АЗС): {tender_ua_id}")
+
             mark_as_processed(t_id)
-            continue
+            mark_as_processed(tender_ua_id)
+        except Exception as e:
+            print(f" -> Ошибка при анализе {tender_ua_id} (будет повторен в следующем цикле): {e}")
 
-        print(f" -> Скачивание документации и экспертиза Gemini для {tender_ua_id}...")
-        docs_text, pdf_parts = extract_all_attachments(tender.get("documents", []))
-        ai_verdict = analyze_tender_with_gemini(tender, docs_text, pdf_parts)
+    return matched_budget, matched_fuel_cpv, sent_to_crm
 
-        if ai_verdict.get("is_relevant"):
-            print(f" -> ПОДТВЕРЖДЕН НАЛИВ! Отправка в Google Sheets и Telegram: {tender_ua_id}")
-            dispatch_to_crm(tender, ai_verdict)
-            sent_to_crm += 1
-        else:
-            print(f" -> Отклонен ИИ после чтения ТД (талоны/карты/не налив): {tender_ua_id}")
+# 9. Главный цикл непрерывного мониторинга с курсором синхронизации и докачкой истории с 20 октября
+def run_monitoring():
+    total_scanned = 0
+    total_active = 0
+    total_budget = 0
+    total_fuel = 0
+    total_sent = 0
 
-        mark_as_processed(t_id)
+    # ФАЗА 1: Чтение новых изменений с вершины ленты до смыкания с прошлым запуском
+    last_top_ts = get_sync_val("last_top_ts")
+    new_top_ts = ""
+    next_url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status"
+    
+    fresh_active_ids = []
+    max_head_pages = 60  # До 6000 свежих записей для гарантированного перекрытия между запусками
+
+    print("=== ФАЗА 1: Проверка свежих изменений ленты Prozorro ===")
+    for page in range(1, max_head_pages + 1):
+        if not next_url:
+            break
+        resp = http_session.get(next_url, timeout=15).json()
+        items_list = resp.get("data", [])
+        if not items_list:
+            break
+
+        if page == 1 and items_list:
+            new_top_ts = items_list[0].get("dateModified", "")
+
+        reached_previous_window = False
+        for item in items_list:
+            total_scanned += 1
+            t_id = item.get("id")
+            status = item.get("status", "")
+            mod_ts = item.get("dateModified", "")
+
+            if status in ("active.enquiries", "active.tendering") and not is_already_processed(t_id):
+                fresh_active_ids.append(t_id)
+
+            if last_top_ts and mod_ts < last_top_ts:
+                reached_previous_window = True
+
+        next_url = resp.get("next_page", {}).get("uri")
+        if reached_previous_window:
+            print(f"Окно синхронизации сомкнуто со штампом прошлого запуска ({last_top_ts}) на стр. {page}.")
+            break
+        if not last_top_ts and page >= 25:
+            # Если это самый первый запуск с курсором, передаем эстафету в Фазу 2 (глубокий Backfill)
+            if not get_sync_val("backfill_next_url") and next_url:
+                set_sync_val("backfill_next_url", next_url)
+            break
+
+    if new_top_ts:
+        set_sync_val("last_top_ts", new_top_ts)
+
+    print(f"Найдено свежих активных тендеров: {len(fresh_active_ids)}")
+    b1, f1, s1 = evaluate_active_tenders(fresh_active_ids)
+    total_active += len(fresh_active_ids)
+    total_budget += b1
+    total_fuel += f1
+    total_sent += s1
+
+    # ФАЗА 2: Автоматическая докачка истории вглубь до 20.10.2026 (включая КП "КИЇВПАСТРАНС")
+    backfill_done = get_sync_val("backfill_done_2026_10_20")
+    backfill_url = get_sync_val("backfill_next_url")
+
+    if not backfill_done and backfill_url:
+        print(f"=== ФАЗА 2: Докачка истории торгов вглубь до {BACKFILL_TARGET_ISO} ===")
+        backfill_active_ids = []
+        max_backfill_pages = 120  # Проверяем по 12 000 исторических записей за один цикл
+
+        for b_page in range(1, max_backfill_pages + 1):
+            if not backfill_url:
+                set_sync_val("backfill_done_2026_10_20", "1")
+                break
+            resp = http_session.get(backfill_url, timeout=15).json()
+            items_list = resp.get("data", [])
+            if not items_list:
+                set_sync_val("backfill_done_2026_10_20", "1")
+                break
+
+            last_mod_in_batch = items_list[-1].get("dateModified", "")
+            for item in items_list:
+                total_scanned += 1
+                t_id = item.get("id")
+                status = item.get("status", "")
+                if status in ("active.enquiries", "active.tendering") and not is_already_processed(t_id):
+                    backfill_active_ids.append(t_id)
+
+            backfill_url = resp.get("next_page", {}).get("uri")
+            set_sync_val("backfill_next_url", backfill_url or "")
+
+            if b_page % 20 == 0:
+                print(f" -> Пройдено {b_page} стр. истории (текущая дата в ленте: {last_mod_in_batch[:16]})...")
+
+            if last_mod_in_batch < BACKFILL_TARGET_ISO:
+                print(f"Достигнута целевая дата истории ({BACKFILL_TARGET_ISO})! Историческая докачка завершена.")
+                set_sync_val("backfill_done_2026_10_20", "1")
+                break
+
+        print(f"Найдено активных тендеров в историческом срезе: {len(backfill_active_ids)}")
+        b2, f2, s2 = evaluate_active_tenders(backfill_active_ids)
+        total_active += len(backfill_active_ids)
+        total_budget += b2
+        total_fuel += f2
+        total_sent += s2
 
     print("=========================================")
     print("ИТОГИ ЦИКЛА МОНИТОРИНГА:")
     print(f"- Всего просмотрено записей в ленте: {total_scanned}")
-    print(f"- Из них новых в статусе приема заявок: {len(active_candidates)}")
-    print(f"- Активных тендеров с бюджетом >= 2.4 млн грн: {matched_budget}")
-    print(f"- Из них по кодам топлива (0913...): {matched_fuel_cpv}")
-    print(f"- Подтверждено наливом и отправлено в Telegram: {sent_to_crm}")
+    print(f"- Из них проверено активных карточек: {total_active}")
+    print(f"- Активных тендеров с бюджетом >= 2.4 млн грн: {total_budget}")
+    print(f"- Из них по кодам топлива (0913...): {total_fuel}")
+    print(f"- Подтверждено наливом и отправлено в Telegram: {total_sent}")
     print("=========================================")
 
 if __name__ == "__main__":
