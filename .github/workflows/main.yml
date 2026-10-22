@@ -4,7 +4,12 @@ on:
   schedule:
     # Автоматический запуск каждые 30 минут 24/7
     - cron: '*/30 * * * *'
-  workflow_dispatch: # Кнопка ручного запуска для проверки в любой момент
+  workflow_dispatch:
+
+# Защита от одновременного наложения двух запусков друг на друга
+concurrency:
+  group: prozorro-fuel-monitor
+  cancel-in-progress: false
 
 jobs:
   monitor:
@@ -36,5 +41,8 @@ jobs:
           git config --global user.name "prozorro-smarttender-bot"
           git config --global user.email "bot@noreply.github.com"
           git add processed_tenders.db
-          git diff --staged --quiet || git commit -m "Update processed tenders DB"
-          git push
+          if ! git diff --staged --quiet; then
+            git commit -m "Update processed tenders DB"
+            git pull --rebase -X theirs origin main
+            git push origin main
+          fi
