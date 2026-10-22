@@ -114,8 +114,6 @@ def format_deadline_strict(iso_str: str) -> str:
 def enforce_clause_source(text: str, default_source: str = "Договора") -> str:
     if not text:
         return ""
-    # Если в скобках указан только номер пункта без названия документа, например (п. 4.1) или (п. 5.1, 5.2),
-    # автоматически дописываем название документа-источника
     pattern = re.compile(r"\((п\.?\s*[\d\.,\s\-а-яіїєґА-ЯІЇЄҐ]+)\)")
     source_keywords = ("догов", "контракт", "тд", "документац", "додат", "прилож", "специф", "оголош", "закон", "постанов")
 
@@ -144,7 +142,7 @@ def calculate_budget_with_vat_strict(tender_data: dict) -> str:
         unit_raw = str(target_items[0].get("unit", {}).get("name", "ед.")).lower()
         if "літр" in unit_raw or "литр" in unit_raw or unit_raw == "л":
             unit_label = "литр"
-        elif "тон" in unit_raw or unit_raw == "т":
+        elif "тон" in unit_raw or "тон" in unit_raw or unit_raw == "т":
             unit_label = "тонну"
         elif "кілогр" in unit_raw or "килогр" in unit_raw or unit_raw == "кг":
             unit_label = "кг"
@@ -340,7 +338,7 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                 },
                 "delivery_mode_and_location": {
                     "type": "STRING",
-                    "description": "Пункт 8: Способ отгрузки (Автотранспорт / ЖД вагон-цистерны), базис Инкотермс и точный адрес передачи товара с указанием пункта и источника (например: п. 5.2 Договора)"
+                    "description": "Пункт 8: Способ отгрузки, базис Инкотермс и точный адрес передачи товара с указанием пункта и источника (например: п. 5.2 Договора)"
                 },
                 "delivery_and_contract_term": {
                     "type": "STRING",
@@ -356,15 +354,15 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                 },
                 "features_pitfalls_and_risks": {
                     "type": "STRING",
-                    "description": "Для кнопки 'Особенности тендера' (Блок 1): Подводные камни, особенности приемки и риски убытков поставщика с номерами пунктов, источником (Договора / Тендерной документации) и прямыми цитатами"
+                    "description": "Для кнопки 'Особенности тендера (Риски поставщика)' (Блок 1): Подводные камни, особенности приемки и риски убытков поставщика с номерами пунктов, источником (Договора / Тендерной документации) и прямыми цитатами"
                 },
                 "features_penalties": {
                     "type": "STRING",
-                    "description": "Для кнопки 'Особенности тендера' (Блок 2): Ответственность поставщика (штрафы, пеня) — размер и за что вменяется, с номерами пунктов, источником (Договора) и прямыми цитатами"
+                    "description": "Для кнопки 'Особенности тендера (Риски поставщика)' (Блок 2): Ответственность поставщика (штрафы, пеня) — размер и за что вменяется, с номерами пунктов, источником (Договора) и прямыми цитатами"
                 },
                 "features_price_increase_rules": {
                     "type": "STRING",
-                    "description": "Для кнопки 'Особенности тендера' (Блок 3): Условия повышения цены (документы, условия, ограничения) с номерами пунктов, источником (Договора / Тендерной документации) и прямыми цитатами"
+                    "description": "Для кнопки 'Особенности тендера (Риски поставщика)' (Блок 3): Условия повышения цены (документы, условия, ограничения) с номерами пунктов, источником (Договора / Тендерной документации) и прямыми цитатами"
                 }
             },
             "required": [
@@ -419,13 +417,11 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
 
     budget_display_str = calculate_budget_with_vat_strict(tender_data)
 
-    # Пункт 7 в строгом формате: "время, дата-месяц-год" (например: 09:00, 23-10-2026)
     raw_end_date = tender_data.get("tenderPeriod", {}).get("endDate", "")
     deadline_formatted = format_deadline_strict(raw_end_date)
 
     tender_url = build_smarttender_url(tender_ua_id)
 
-    # Применяем контроль указания источника (Договора / Тендерной документации) ко всем полям со ссылками на пункты
     payment_terms_clean = enforce_clause_source(ai.get("payment_terms", ""), "Договора")
     delivery_loc_clean = enforce_clause_source(ai.get("delivery_mode_and_location", ""), "Договора")
     delivery_term_clean = enforce_clause_source(ai.get("delivery_and_contract_term", ""), "Договора")
@@ -446,10 +442,9 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     else:
         pricing_html = "Цена фиксированная"
 
-    # Пункт 1: БЕЗ слова "Заказчик", наименование заказчика выделено жирным шрифтом
+    # Обновленная шапка "Тендер, ID: ..." и Пункт 8 без "(Авто / ЖД)"
     card_html = (
-        f"<b>НОВЫЙ ТЕНДЕР (ПОСТАВКА НАЛИВОМ: АВТО / ЖД)</b>\n"
-        f"<b>ID закупки:</b> <code>{html.escape(tender_ua_id)}</code>\n"
+        f"<b>Тендер, ID:</b> <code>{html.escape(tender_ua_id)}</code>\n"
         f"-----------------------------------------\n"
         f"<b>1) {html.escape(customer_str)}</b>\n\n"
         f"<b>2) Предмет закупки и вид торгов:</b> {html.escape(subject_and_proc)}\n\n"
@@ -458,7 +453,7 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
         f"<b>5) Условия оплаты:</b> {html.escape(payment_terms_clean)}\n\n"
         f"<b>6) Ценообразование:</b> {pricing_html}\n\n"
         f"<b>7) Срок подачи тендерного предложения:</b> до {html.escape(deadline_formatted)}\n\n"
-        f"<b>8) Условия поставки и адрес передачи товара (Авто / ЖД):</b> {html.escape(delivery_loc_clean)}\n\n"
+        f"<b>8) Условия поставки и адрес передачи товара:</b> {html.escape(delivery_loc_clean)}\n\n"
         f"<b>9) Срок поставки и срок действия договора:</b> {html.escape(delivery_term_clean)}\n\n"
         f"<b>10) Обеспечение тендерного предложения:</b> {html.escape(bid_sec_clean)}\n\n"
         f"<b>11) Обеспечение договора:</b> {html.escape(contract_sec_clean)}\n\n"
