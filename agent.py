@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import time
 import html
 import json
 import zipfile
@@ -36,7 +37,7 @@ GEMINI_MODELS_FALLBACK = (
     "gemini-2.5-pro",
 )
 
-# Справочник видов торгов Prozorro (БЕЗ упоминания Постановления КМУ №1178)
+# Справочник видов торгов Prozorro (без упоминания Постановления КМУ №1178)
 PROCUREMENT_METHODS = {
     "aboveThreshold": "Открытые торги с особенностями",
     "aboveThresholdUA": "Открытые торги",
@@ -47,10 +48,10 @@ PROCUREMENT_METHODS = {
     "belowThreshold": "Упрощенная / допороговая закупка"
 }
 
-# 2. Быстрая HTTP-сессия с постоянным пулом соединений (Keep-Alive)
+# 2. HTTP-сессия с пулом соединений (настроена под 15 потоков и автоповтор)
 http_session = requests.Session()
-retries = Retry(total=3, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
-adapter = HTTPAdapter(pool_connections=40, pool_maxsize=40, max_retries=retries)
+retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retries)
 http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
 
@@ -96,7 +97,6 @@ def calculate_budget_with_vat_strict(tender_data: dict) -> str:
     budget_raw = float(tender_data.get("value", {}).get("amount", 0) or 0)
     items = tender_data.get("items", [])
     
-    # Отбираем топливные позиции (или все позиции, если классификатор единый)
     fuel_items = [
         i for i in items
         if str(i.get("classification", {}).get("id", "")).startswith(TARGET_CPV_PREFIXES)
@@ -161,7 +161,7 @@ def parse_old_doc_bytes(file_bytes: bytes, filename: str) -> str:
         pass
     return ""
 
-# 7. Выгрузка актуальных редакций всех вложений
+# 7. Выгрузка актуальных редакций всех вложений (.docx, .doc, .pdf, .zip)
 def extract_all_attachments(documents_json: list) -> tuple[str, list]:
     latest_docs = {}
     for d in documents_json:
@@ -273,7 +273,7 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
             "АВТОМОБИЛЬНЫМ ТРАНСПОРТОМ (бензовозами/автоцистернами в резервуары заказчика или самовывозом) ИЛИ ЖЕЛЕЗНОДОРОЖНЫМ ТРАНСПОРТОМ (вагон-цистернами).\n"
             "2. ВАЖНО: Если основной предмет закупки — талоны, топливные карты, скретч-карты, бланки-разрешения или требуется наличие сети АЗС для заправки машин "
             "(даже если в договоре есть резервный пункт о наливе на случай остановки работы АЗС) — строго верни is_relevant = false!\n"
-            "3. В поле subject_and_procedure НЕ указывай '(Постановление КМУ №1178)' — пиши только предмет закупки и чистый вид процедуры (например: 'Открытые торги с особенностями. Предмет закупки: Дизельное топливо наливом' или 'Запрос ценовых предложений. Предмет закупки: ...').\n"
+            "3. В поле subject_and_procedure НЕ указывай '(Постановление КМУ №1178)' — пиши только предмет закупки и чистый вид процедуры.\n"
             "Все ответы формируй на русском языке (прямые цитаты из украинского договора приводи дословно в кавычках с указанием номера пункта договора)."
         ),
         response_mime_type="application/json",
@@ -368,10 +368,13 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     method_type = tender_data.get("procurementMethodType", "")
     procedure_clean = PROCUREMENT_METHODS.get(method_type, "Открытые торги")
 
-    # Очищаем пункт 2 от любого случайного упоминания Постановления КМУ №1178
-    subject_and_proc = re.sub(r"\s*\(?Постановление КМУ №\s*1178\)?", "", ai.get("subject_and_procedure", ""), flags=re.IGNORECASE).strip()
+    subject_and_proc = re.sub(
+        r"\s*\(?Постановление КМУ №\s*1178\)?",
+        "",
+        ai.get("subject_and_procedure", ""),
+        flags=re.IGNORECASE
+    ).strip()
 
-    # Строгий расчет для пункта 4 (только цена за ед. с НДС для 1 позиции, или только бюджет с НДС для >1 позиций)
     budget_display_str = calculate_budget_with_vat_strict(tender_data)
 
     deadline = tender_data.get("tenderPeriod", {}).get("endDate", "Не указан")[:16].replace("T", " ")
@@ -444,22 +447,28 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     resp = http_session.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
     print(f" -> Ответ Google Таблицы: {resp.text[:120]}")
 
+# 10. Загрузка карточки тендера с защитой и автоповтором при коде 429
 def fetch_tender_detail(t_id: str) -> dict:
-    try:
-        r = http_session.get(f"{PROZORRO_API_BASE}/tenders/{t_id}", timeout=12)
-        if r.status_code == 200:
-            return r.json().get("data", {})
-    except Exception:
-        pass
+    for attempt in range(4):
+        try:
+            r = http_session.get(f"{PROZORRO_API_BASE}/tenders/{t_id}", timeout=12)
+            if r.status_code == 200:
+                return r.json().get("data", {})
+            elif r.status_code == 429:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+        except Exception:
+            pass
     return {}
 
+# 11. Оценка активных тендеров (снижено до 15 параллельных потоков: max_workers=15)
 def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
     matched_budget = 0
     matched_fuel_cpv = 0
     sent_to_crm = 0
     fuel_tenders_to_analyze = []
 
-    with ThreadPoolExecutor(max_workers=35) as executor:
+    with ThreadPoolExecutor(max_workers=15) as executor:
         future_to_id = {executor.submit(fetch_tender_detail, tid): tid for tid in active_ids}
         for future in as_completed(future_to_id):
             tid = future_to_id[future]
@@ -516,7 +525,7 @@ def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
 
     return matched_budget, matched_fuel_cpv, sent_to_crm
 
-# 10. Главный цикл непрерывного мониторинга
+# 12. Главный цикл непрерывного мониторинга
 def run_monitoring():
     total_scanned = 0
     total_active = 0
