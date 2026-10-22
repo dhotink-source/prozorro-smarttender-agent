@@ -7,6 +7,7 @@ import zipfile
 import sqlite3
 import requests
 import docx
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from google import genai
 from google.genai import types
 
@@ -16,7 +17,9 @@ GOOGLE_WEB_APP_URL = os.environ.get("GOOGLE_WEB_APP_URL")
 SECRET_BRIDGE_KEY = os.environ.get("SECRET_BRIDGE_KEY", "FUEL_TENDER_SECRET_2026")
 
 PROZORRO_API_BASE = "https://public-api.prozorro.gov.ua/api/2.5"
-MIN_AMOUNT_UAH = 3000000
+
+# Порог бюджета снижен до 2,4 млн грн (2 400 000 грн)
+MIN_AMOUNT_UAH = 2400000
 TARGET_CPV_PREFIXES = ("09130000", "09132000", "09134200")
 
 # Быстрый фильтр для отсева очевидных талонов, карт и бланков в заголовке
@@ -54,7 +57,6 @@ def mark_as_processed(tender_id: str):
 
 # 3. Формирование прямой ссылки на закупку на площадке SmartTender.biz
 def build_smarttender_url(tender_ua_id: str) -> str:
-    # Официальный шлюз SmartTender для прямого перехода к тендеру по идентификатору Prozorro
     gateway_url = f"https://smarttender.biz/government/details/{tender_ua_id}"
     try:
         resp = requests.head(gateway_url, allow_redirects=True, timeout=8)
@@ -110,7 +112,6 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
     def doc_priority(doc_item):
         t = doc_item.get("title", "").lower()
-        # Наивысший приоритет проекту договора, техзаданию и тендерной документации
         if any(k in t for k in ("догов", "контракт", "техніч", "документац", "додаток", "специфікац", "вимог")):
             return 0
         return 1
@@ -209,11 +210,11 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                     },
                     "unit_price_calculation": {
                         "type": "STRING",
-                        "description": "Пункт 4: Расчетная предельная цена за 1 единицу (литр/тонну/кг) с НДС исходя из бюджета закупки и объема (если несколько позиций — указать расчет по ним)"
+                        "description": "Пункт 4: Расчетная предельная цена за 1 единицу (литр/тонну/кг) с НДС исходя из бюджета закупки и объема"
                     },
                     "payment_terms": {
                         "type": "STRING",
-                        "description": "Пункт 5: Условия оплаты (отсрочка в банковских/календарных днях, по факту поставки или предоплата, перечень документов для оплаты)"
+                        "description": "Пункт 5: Условия оплаты (отсрочка в банковских/календарных днях, по факту поставки или предоплата)"
                     },
                     "is_formula_pricing": {
                         "type": "BOOLEAN",
@@ -221,35 +222,35 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                     },
                     "formula_details": {
                         "type": "STRING",
-                        "description": "Пункт 6: Если цена формульная — точная математическая формула и описание всех ее коэффициентов (Platts/Argus, курс НБУ, акциз, маржа) согласно договору. Если фиксированная — напиши 'Цена фиксированная'"
+                        "description": "Пункт 6: Если цена формульная — точная математическая формула и описание всех ее коэффициентов согласно договору. Если фиксированная — напиши 'Цена фиксированная'"
                     },
                     "delivery_mode_and_location": {
                         "type": "STRING",
-                        "description": "Пункт 8: Способ отгрузки (Автотранспорт / ЖД вагон-цистерны), базис Инкотермс (DDP/EXW/FCA/CPT) и точный адрес передачи товара или ж/д станция назначения (с кодом станции, если указан)"
+                        "description": "Пункт 8: Способ отгрузки (Автотранспорт / ЖД вагон-цистерны), базис Инкотермс (DDP/EXW/FCA/CPT) и точный адрес передачи товара или ж/д станция назначения"
                     },
                     "delivery_and_contract_term": {
                         "type": "STRING",
-                        "description": "Пункт 9: Срок поставки отдельной партии по заявке (часов/дней), общий период поставки и срок действия договора (до какой даты)"
+                        "description": "Пункт 9: Срок поставки отдельной партии по заявке, общий период поставки и срок действия договора"
                     },
                     "bid_security_uah": {
                         "type": "STRING",
-                        "description": "Пункт 10: Обеспечение тендерного предложения — точный размер гарантии в сумме (грн) и срок ее действия"
+                        "description": "Пункт 10: Обеспечение тендерного предложения — точный размер гарантии в сумме (грн)"
                     },
                     "contract_security_details": {
                         "type": "STRING",
-                        "description": "Пункт 11: Обеспечение выполнения договора — вид обеспечения (банковская гарантия / депозит на счет заказчика) и размер в % от суммы договора (если не требуется — указать 'Не требуется')"
+                        "description": "Пункт 11: Обеспечение выполнения договора — вид обеспечения (гарантия / депозит) и размер в % от суммы договора"
                     },
                     "features_pitfalls_and_risks": {
                         "type": "STRING",
-                        "description": "Для кнопки 'Особенности тендера' (Блок 1): Подводные камни по договору, особенности приемки по количеству и качеству (риски убытков поставщика: простой авто/жд цистерн, экспертиза за счет поставщика, температурный пересчет в кг/литры и др.) с номерами пунктов и прямыми цитатами"
+                        "description": "Для кнопки 'Особенности тендера' (Блок 1): Подводные камни по договору, особенности приемки и риски убытков поставщика с номерами пунктов и прямыми цитатами"
                     },
                     "features_penalties": {
                         "type": "STRING",
-                        "description": "Для кнопки 'Особенности тендера' (Блок 2): Ответственность поставщика (штрафные санкции, пеня, оперативно-хозяйственные санкции) — точный размер в % или сумме и за что вменяется, с номерами пунктов договора и прямыми цитатами"
+                        "description": "Для кнопки 'Особенности тендера' (Блок 2): Ответственность поставщика (штрафные санкции, пеня) — размер и за что вменяется, с номерами пунктов договора и прямыми цитатами"
                     },
                     "features_price_increase_rules": {
                         "type": "STRING",
-                        "description": "Для кнопки 'Особенности тендера' (Блок 3): Условия повышения цены за единицу товара (на основании каких документов можно поднять цену — ТПП, Держзовнішінформ, ДП Прозорро, Platts; какие условия и ограничения по частоте/срокам/процентам колебания) с номерами пунктов договора и прямыми цитатами"
+                        "description": "Для кнопки 'Особенности тендера' (Блок 3): Условия повышения цены (на основании каких документов можно поднять цену, условия и ограничения) с номерами пунктов договора и прямыми цитатами"
                     }
                 },
                 "required": [
@@ -279,11 +280,8 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     budget_full_str = f"{budget_num:,.2f} грн ({vat_str}) | Расчет за ед.: {ai['unit_price_calculation']}"
 
     deadline = tender_data.get("tenderPeriod", {}).get("endDate", "Не указан")[:16].replace("T", " ")
-
-    # Получаем прямую ссылку на SmartTender.biz для колонки I и пункта 12
     smarttender_url = build_smarttender_url(tender_ua_id)
 
-    # Форматирование пункта 6 (Спойлер для формулы или "Цена фиксированная")
     is_formula = bool(ai.get("is_formula_pricing"))
     formula_raw = ai.get("formula_details", "")
     if is_formula:
@@ -294,7 +292,6 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     else:
         pricing_html = "Цена фиксированная"
 
-    # Сборка сообщения строго по 12 обязательным пунктам ТЗ (HTML разметка)
     card_html = (
         f"<b>НОВЫЙ ТЕНДЕР (ПОСТАВКА НАЛИВОМ: АВТО / ЖД)</b>\n"
         f"<b>ID закупки:</b> <code>{html.escape(tender_ua_id)}</code>\n"
@@ -315,7 +312,6 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
         f"<i>Ответьте (Reply) свободным текстом на это сообщение, чтобы ИИ внес вашу цену, статус или результат в таблицу.</i>"
     )
 
-    # Полный текст для кнопки "Особенности тендера" (сохраняется в колонку M и выводится по кнопке)
     features_detailed_text = (
         f"1. ПОДВОДНЫЕ КАМНИ, ПРИЕМКА И РИСКИ УБЫТКОВ ПОСТАВЩИКА:\n"
         f"{ai['features_pitfalls_and_risks']}\n\n"
@@ -348,22 +344,31 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
         }
     }
 
-    requests.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
+    resp = requests.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
+    print(f" -> Ответ Google Таблицы: {resp.text[:120]}")
 
-# 8. Главный цикл мониторинга Prozorro (с пагинацией на 15 страниц = 1500 тендеров)
+# Вспомогательная функция параллельной загрузки полной карточки тендера
+def fetch_tender_detail(t_id: str) -> dict:
+    try:
+        r = requests.get(f"{PROZORRO_API_BASE}/tenders/{t_id}", timeout=12)
+        if r.status_code == 200:
+            return r.json().get("data", {})
+    except Exception:
+        pass
+    return {}
+
+# 8. Главный цикл мониторинга Prozorro
 def run_monitoring():
-    next_url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status,value"
-    pages_to_scan = 15  # Проверяем 1500 последних тендеров в ленте Prozorro
-    
-    total_scanned = 0
-    matched_budget = 0
-    matched_fuel_cpv = 0
-    sent_to_crm = 0
+    next_url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status"
+    pages_to_scan = 20  # Просматриваем 2000 последних тендеров в ленте
 
+    total_scanned = 0
+    active_candidates = []
+
+    # Шаг 1: Быстрый сбор всех активных тендеров из ленты
     for page in range(1, pages_to_scan + 1):
         if not next_url:
             break
-            
         print(f"Чтение страницы {page}/{pages_to_scan} ленты Prozorro...")
         resp = requests.get(next_url, timeout=15).json()
         items_list = resp.get("data", [])
@@ -371,61 +376,81 @@ def run_monitoring():
 
         for item in items_list:
             total_scanned += 1
-            t_id = item["id"]
+            t_id = item.get("id")
             status = item.get("status", "")
-            amount = item.get("value", {}).get("amount", 0)
 
-            # 1. Фильтр по статусу и бюджету от 3 млн грн
-            if status not in ("active.enquiries", "active.tendering") or amount < MIN_AMOUNT_UAH:
+            if status in ("active.enquiries", "active.tendering") and not is_already_processed(t_id):
+                active_candidates.append(t_id)
+
+    print(f"Найдено новых активных тендеров для проверки карточек: {len(active_candidates)}")
+
+    matched_budget = 0
+    matched_fuel_cpv = 0
+    sent_to_crm = 0
+    fuel_tenders_to_analyze = []
+
+    # Шаг 2: Многопоточная загрузка карточек активных тендеров (проверка бюджета >= 2.4 млн и кода ДК)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_id = {executor.submit(fetch_tender_detail, tid): tid for tid in active_candidates}
+        for future in as_completed(future_to_id):
+            tid = future_to_id[future]
+            tender = future.result()
+            if not tender:
                 continue
-            if is_already_processed(t_id):
+
+            # Извлекаем точный бюджет из полной карточки тендера
+            amount = float(tender.get("value", {}).get("amount", 0) or 0)
+            if amount < MIN_AMOUNT_UAH:
+                mark_as_processed(tid)
                 continue
 
             matched_budget += 1
 
-            # 2. Загрузка полной карточки тендера
-            detail_resp = requests.get(f"{PROZORRO_API_BASE}/tenders/{t_id}", timeout=15).json()
-            tender = detail_resp.get("data", {})
-            tender_ua_id = tender.get("tenderID", t_id)
-
-            # 3. Фильтр по кодам ДК 021:2015 (Нефть, бензин, дизельное топливо)
+            # Проверяем коды ДК 021:2015 (09130000, 09132000, 09134200)
             items = tender.get("items", [])
             has_fuel_cpv = any(
-                i.get("classification", {}).get("id", "").startswith(TARGET_CPV_PREFIXES)
+                str(i.get("classification", {}).get("id", "")).startswith(TARGET_CPV_PREFIXES)
                 for i in items
             )
             if not has_fuel_cpv:
-                mark_as_processed(t_id)
+                mark_as_processed(tid)
                 continue
 
             matched_fuel_cpv += 1
-            full_title = f"{tender.get('title', '')} {tender.get('description', '')}"
-            print(f"Найден топливный тендер >= 3 млн: {tender_ua_id} | {amount:,.2f} грн | {tender.get('title', '')[:60]}")
+            fuel_tenders_to_analyze.append(tender)
 
-            # 4. Быстрый отсев явных талонов и карт в заголовке
-            if STOP_WORDS_REGEX.search(full_title):
-                print(f" -> Отсеян по стоп-словам (талоны/карты/АЗС) в заголовке: {tender_ua_id}")
-                mark_as_processed(t_id)
-                continue
+    # Шаг 3: Глубокий анализ найденных топливных тендеров через Gemini API
+    for tender in fuel_tenders_to_analyze:
+        t_id = tender["id"]
+        tender_ua_id = tender.get("tenderID", t_id)
+        amount = float(tender.get("value", {}).get("amount", 0) or 0)
+        full_title = f"{tender.get('title', '')} {tender.get('description', '')}"
 
-            # 5. Выгрузка документации и глубокий анализ через Gemini API
-            print(f" -> Скачивание вложений и запуск экспертизы Gemini для {tender_ua_id}...")
-            docs_text, pdf_parts = extract_all_attachments(tender.get("documents", []))
-            ai_verdict = analyze_tender_with_gemini(tender, docs_text, pdf_parts)
+        print(f"Топливный тендер >= 2.4 млн: {tender_ua_id} | {amount:,.2f} грн | {tender.get('title', '')[:65]}")
 
-            if ai_verdict.get("is_relevant"):
-                print(f" -> ПОДТВЕРЖДЕН НАЛИВ! Отправка в Google Sheets и Telegram: {tender_ua_id}")
-                dispatch_to_crm(tender, ai_verdict)
-                sent_to_crm += 1
-            else:
-                print(f" -> Отклонен ИИ после чтения ТД (не налив): {tender_ua_id}")
-
+        if STOP_WORDS_REGEX.search(full_title):
+            print(f" -> Отсеян по стоп-словам (талоны/карты/АЗС) в заголовке: {tender_ua_id}")
             mark_as_processed(t_id)
+            continue
+
+        print(f" -> Скачивание документации и экспертиза Gemini для {tender_ua_id}...")
+        docs_text, pdf_parts = extract_all_attachments(tender.get("documents", []))
+        ai_verdict = analyze_tender_with_gemini(tender, docs_text, pdf_parts)
+
+        if ai_verdict.get("is_relevant"):
+            print(f" -> ПОДТВЕРЖДЕН НАЛИВ! Отправка в Google Sheets и Telegram: {tender_ua_id}")
+            dispatch_to_crm(tender, ai_verdict)
+            sent_to_crm += 1
+        else:
+            print(f" -> Отклонен ИИ после чтения ТД (талоны/карты/не налив): {tender_ua_id}")
+
+        mark_as_processed(t_id)
 
     print("=========================================")
-    print(f"ИТОГИ ЦИКЛА МОНИТОРИНГА:")
-    print(f"- Всего просмотрено тендеров в ленте: {total_scanned}")
-    print(f"- Активных тендеров с бюджетом >= 3 млн грн: {matched_budget}")
+    print("ИТОГИ ЦИКЛА МОНИТОРИНГА:")
+    print(f"- Всего просмотрено записей в ленте: {total_scanned}")
+    print(f"- Из них новых в статусе приема заявок: {len(active_candidates)}")
+    print(f"- Активных тендеров с бюджетом >= 2.4 млн грн: {matched_budget}")
     print(f"- Из них по кодам топлива (0913...): {matched_fuel_cpv}")
     print(f"- Подтверждено наливом и отправлено в Telegram: {sent_to_crm}")
     print("=========================================")
