@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import sys
 import time
 import html
 import json
@@ -16,6 +17,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from google import genai
 from google.genai import types
 
+# Мгновенный вывод каждой строки в лог GitHub Actions без буферизации
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+
 # 1. Конфигурация ключей из GitHub Secrets
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_WEB_APP_URL = os.environ.get("GOOGLE_WEB_APP_URL")
@@ -27,14 +32,23 @@ PROZORRO_API_BASE = "https://public-api.prozorro.gov.ua/api/2.5"
 MIN_AMOUNT_UAH = 2400000
 TARGET_CPV_PREFIXES = ("09130000", "09132000", "09134200")
 
-BACKFILL_TARGET_ISO = "2026-10-20T00:00:00"
+# Максимум тяжелых проверок через Gemini за один цикл (защита от превышения минутного лимита Free Tier 250k TPM)
+MAX_GEMINI_ANALYSES_PER_RUN = 4
 
+# Актуальный список моделей для новых ключей Google AI Studio (без устаревшей gemini-2.5-pro)
 GEMINI_MODELS_FALLBACK = (
     "gemini-3.0-flash",
+    "gemini-3.1-pro-preview",
     "gemini-3-flash-preview",
     "gemini-flash-latest",
-    "gemini-2.5-pro",
 )
+
+# Регулярное выражение для распознавания явных талонов/карт
+COUPON_CARD_REGEX = re.compile(
+    r"(талон|скретч|смарт-?карт|паливн[іи]х?\s+карт|бланк[іи]?в?-дозвол|заправк[аи]\s+на\s+азс|відпуск\s+з\s+азс)",
+    re.IGNORECASE
+)
+BULK_KEYWORD_REGEX = re.compile(r"(налив|автоцистерн|бензовоз|вагон-?цистерн)", re.IGNORECASE)
 
 PROCUREMENT_METHODS = {
     "aboveThreshold": "Открытые торги с особенностями",
@@ -89,7 +103,32 @@ def set_sync_val(key: str, val: str):
     cursor.execute("INSERT OR REPLACE INTO sync_state (key, val) VALUES (?, ?)", (key, val))
     conn.commit()
 
-# 4. Формирование прямой ссылки на закупку на площадке SmartTender.biz
+# 4. Умная проверка явных талонов/карт с полной защитой многолотовых закупок
+def is_strictly_coupons_or_cards(tender: dict) -> bool:
+    full_header = f"{tender.get('title', '')} {tender.get('description', '')}"
+    items_desc = " ".join(str(i.get("description", "")) for i in tender.get("items", []))
+    combined_text = f"{full_header} {items_desc}"
+
+    # Если где-либо в заголовке или позициях есть слово "налив" / "бензовоз" / "автоцистерна" — никогда не отсеиваем!
+    if BULK_KEYWORD_REGEX.search(combined_text):
+        return False
+
+    lots = tender.get("lots", [])
+    if len(lots) > 1:
+        # В многолотовом тендере проверяем каждый активный лот отдельно:
+        # отсеиваем только если АБСОЛЮТНО ВСЕ лоты явно содержат слова про талоны/карты
+        active_lots = [l for l in lots if l.get("status", "active") == "active"]
+        if active_lots:
+            all_lots_are_coupons = all(
+                bool(COUPON_CARD_REGEX.search(f"{l.get('title', '')} {l.get('description', '')}"))
+                for l in active_lots
+            )
+            return all_lots_are_coupons
+
+    # Для однолотового тендера: если в заголовке прямо указаны талоны/топливные карты/скретч-карты
+    return bool(COUPON_CARD_REGEX.search(full_header))
+
+# 5. Формирование прямой ссылки на закупку на площадке SmartTender.biz
 def build_smarttender_url(tender_ua_id: str) -> str:
     gateway_url = f"https://smarttender.biz/government/details/{tender_ua_id}"
     try:
@@ -100,7 +139,7 @@ def build_smarttender_url(tender_ua_id: str) -> str:
         pass
     return gateway_url
 
-# 5. Форматирование даты и времени для Пункта 7 строго в формат: "ЧЧ:ММ, ДД-ММ-ГГГГ"
+# 6. Форматирование даты и времени для Пункта 7 строго в формат: "ЧЧ:ММ, ДД-ММ-ГГГГ"
 def format_deadline_strict(iso_str: str) -> str:
     if not iso_str:
         return "Не указан"
@@ -110,7 +149,7 @@ def format_deadline_strict(iso_str: str) -> str:
         return f"{time_hm}, {day}-{month}-{year}"
     return str(iso_str)[:16].replace("T", " ")
 
-# 6. Гарантированное указание источника при ссылке на пункты: "(п. 4.1)" -> "(п. 4.1 Договора)"
+# 7. Гарантированное указание источника при ссылке на пункты: "(п. 4.1)" -> "(п. 4.1 Договора)"
 def enforce_clause_source(text: str, default_source: str = "Договора") -> str:
     if not text:
         return ""
@@ -126,7 +165,7 @@ def enforce_clause_source(text: str, default_source: str = "Договора") -
 
     return pattern.sub(replacer, text)
 
-# 7. Строгий математический расчет для Пункта 4 (ТОЛЬКО с НДС по формуле * 1.2)
+# 8. Строгий математический расчет для Пункта 4 (ТОЛЬКО с НДС по формуле * 1.2)
 def calculate_budget_with_vat_strict(tender_data: dict) -> str:
     budget_raw = float(tender_data.get("value", {}).get("amount", 0) or 0)
     items = tender_data.get("items", [])
@@ -142,7 +181,7 @@ def calculate_budget_with_vat_strict(tender_data: dict) -> str:
         unit_raw = str(target_items[0].get("unit", {}).get("name", "ед.")).lower()
         if "літр" in unit_raw or "литр" in unit_raw or unit_raw == "л":
             unit_label = "литр"
-        elif "тон" in unit_raw or "тон" in unit_raw or unit_raw == "т":
+        elif "тон" in unit_raw or unit_raw == "т":
             unit_label = "тонну"
         elif "кілогр" in unit_raw or "килогр" in unit_raw or unit_raw == "кг":
             unit_label = "кг"
@@ -156,7 +195,7 @@ def calculate_budget_with_vat_strict(tender_data: dict) -> str:
     total_with_vat = budget_raw * 1.2
     return f"{total_with_vat:,.2f} грн с НДС".replace(",", " ")
 
-# 8. Чтение файлов .docx и старых файлов .doc (Word 97-2003)
+# 9. Чтение файлов .docx и старых файлов .doc (Word 97-2003)
 def parse_docx_bytes(file_bytes: bytes, filename: str) -> str:
     try:
         doc = docx.Document(io.BytesIO(file_bytes))
@@ -177,7 +216,7 @@ def parse_docx_bytes(file_bytes: bytes, filename: str) -> str:
                         last_txt = c_txt
                 if cells:
                     lines.append(" | ".join(cells))
-        return "\n".join(lines)[:45000]
+        return "\n".join(lines)[:35000]
     except Exception as e:
         return f"Ошибка чтения DOCX {filename}: {e}"
 
@@ -188,12 +227,12 @@ def parse_old_doc_bytes(file_bytes: bytes, filename: str) -> str:
             tmp.flush()
             res = subprocess.run(["antiword", tmp.name], capture_output=True, text=True, timeout=10)
             if res.returncode == 0 and res.stdout.strip():
-                return f"=== ДОКУМЕНТ (DOC): {filename} ===\n" + res.stdout[:45000]
+                return f"=== ДОКУМЕНТ (DOC): {filename} ===\n" + res.stdout[:35000]
     except Exception:
         pass
     return ""
 
-# 9. Выгрузка актуальных редакций всех вложений (.docx, .doc, .pdf, .zip)
+# 10. Выгрузка актуальных редакций вложений (оптимизировано по объему токенов для Free Tier)
 def extract_all_attachments(documents_json: list) -> tuple[str, list]:
     latest_docs = {}
     for d in documents_json:
@@ -223,14 +262,14 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
     extracted_texts = []
     pdf_parts = []
 
-    for d in valid_docs[:8]:
+    for d in valid_docs[:6]:
         title = d.get("title", "document")
         url = d.get("url", "")
         if not url:
             continue
 
         try:
-            resp = http_session.get(url, timeout=25)
+            resp = http_session.get(url, timeout=20)
             if resp.status_code != 200:
                 continue
             content = resp.content
@@ -243,12 +282,12 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
                 if doc_txt:
                     extracted_texts.append(doc_txt)
             elif low_title.endswith(".pdf"):
-                if len(content) < 15 * 1024 * 1024 and len(pdf_parts) < 3:
+                if len(content) < 10 * 1024 * 1024 and len(pdf_parts) < 2:
                     pdf_parts.append(types.Part.from_bytes(data=content, mime_type="application/pdf"))
                     extracted_texts.append(f"[Прикреплен PDF-документ: {title}]")
             elif low_title.endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(content)) as zf:
-                    for inner_name in zf.namelist()[:8]:
+                    for inner_name in zf.namelist()[:6]:
                         low_inner = inner_name.lower()
                         if low_inner.endswith((".p7s", ".sig")):
                             continue
@@ -259,7 +298,7 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
                             doc_txt = parse_old_doc_bytes(inner_bytes, f"{title}/{inner_name}")
                             if doc_txt:
                                 extracted_texts.append(doc_txt)
-                        elif low_inner.endswith(".pdf") and len(inner_bytes) < 15 * 1024 * 1024 and len(pdf_parts) < 3:
+                        elif low_inner.endswith(".pdf") and len(inner_bytes) < 10 * 1024 * 1024 and len(pdf_parts) < 2:
                             pdf_parts.append(types.Part.from_bytes(data=inner_bytes, mime_type="application/pdf"))
                             extracted_texts.append(f"[Прикреплен PDF из архива: {inner_name}]")
         except Exception as e:
@@ -267,7 +306,7 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
     return "\n\n".join(extracted_texts), pdf_parts
 
-# 10. Когнитивная экспертиза через Gemini 3.0 Flash
+# 11. Когнитивная экспертиза через Gemini 3.0 Flash / 3.1 Pro Preview
 def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: list) -> dict:
     val = tender_data.get("value", {})
     budget_amount = val.get("amount", 0)
@@ -292,7 +331,7 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
     Электронные условия оплаты и поставки (milestones): {milestones_json}
 
     ПОЛНЫЙ ТЕКСТ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ И ПРОЕКТА ДОГОВОРА:
-    {docs_text[:95000]}
+    {docs_text[:65000]}
     """
 
     contents = [prompt] + pdf_parts
@@ -376,9 +415,9 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
         temperature=0.0
     )
 
-    last_err = None
+    primary_err = None
     for model_name in GEMINI_MODELS_FALLBACK:
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 response = client.models.generate_content(
                     model=model_name,
@@ -387,17 +426,18 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                 )
                 return json.loads(response.text)
             except Exception as err:
-                last_err = err
                 err_str = str(err)
+                if primary_err is None and "404" not in err_str:
+                    primary_err = err
                 if "404" in err_str or "NOT_FOUND" in err_str:
                     break
                 if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    time.sleep(4 * (attempt + 1))
+                    time.sleep(5 * (attempt + 1))
                     continue
                 break
-    raise last_err
+    raise (primary_err or Exception("Все модели Gemini временно перегружены"))
 
-# 11. Сборка карточки из 12 пунктов и передача в Google Sheets CRM (17 колонок)
+# 12. Сборка карточки из 12 пунктов и передача в Google Sheets CRM (17 колонок)
 def dispatch_to_crm(tender_data: dict, ai: dict):
     tender_ua_id = tender_data.get("tenderID", "Не указан")
     entity = tender_data.get("procuringEntity", {})
@@ -442,7 +482,6 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     else:
         pricing_html = "Цена фиксированная"
 
-    # Обновленная шапка "Тендер, ID: ..." и Пункт 8 без "(Авто / ЖД)"
     card_html = (
         f"<b>Тендер, ID:</b> <code>{html.escape(tender_ua_id)}</code>\n"
         f"-----------------------------------------\n"
@@ -499,7 +538,7 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     resp = http_session.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
     print(f" -> Ответ Google Таблицы: {resp.text[:120]}")
 
-# 12. Загрузка карточки тендера с защитой и автоповтором при коде 429
+# 13. Загрузка карточки тендера с защитой и автоповтором при коде 429
 def fetch_tender_detail(t_id: str) -> dict:
     for attempt in range(4):
         try:
@@ -513,11 +552,12 @@ def fetch_tender_detail(t_id: str) -> dict:
             pass
     return {}
 
-# 13. Оценка активных тендеров (max_workers=15 + сохранение в retry_queue при временных сбоях)
-def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
+# 14. Оценка активных тендеров (с умным отсевом явных карт/талонов и дозированием Gemini до 4 за цикл)
+def evaluate_active_tenders(active_ids: list, gemini_budget_left: int) -> tuple[int, int, int, int]:
     matched_budget = 0
     matched_fuel_cpv = 0
     sent_to_crm = 0
+    gemini_used = 0
     fuel_tenders_to_analyze = []
 
     with ThreadPoolExecutor(max_workers=15) as executor:
@@ -559,10 +599,26 @@ def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
         amount = float(tender.get("value", {}).get("amount", 0) or 0)
         print(f"Топливный тендер >= 2.4 млн: {tender_ua_id} | {amount:,.2f} грн | {tender.get('title', '')[:70]}")
 
+        # Быстрый отсев однолотовых талонов/карт без траты квоты Gemini API
+        if is_strictly_coupons_or_cards(tender):
+            print(f" -> Мгновенно отсеян (явные талоны/топливные карты без налива): {tender_ua_id}")
+            mark_as_processed(t_id)
+            mark_as_processed(tender_ua_id)
+            continue
+
+        # Если лимит вызовов Gemini на текущий цикл исчерпан — сохраняем в очередь на следующий цикл
+        if gemini_used >= gemini_budget_left:
+            print(f" -> Достигнут лимит ИИ на 1 цикл ({MAX_GEMINI_ANALYSES_PER_RUN} шт.), {tender_ua_id} проверим в следующем цикле.")
+            add_to_retry_queue(t_id)
+            continue
+
         try:
-            print(f" -> Скачивание документации и экспертиза Gemini 3.0 Flash для {tender_ua_id}...")
+            if gemini_used > 0:
+                time.sleep(6)  # Пауза между вызовами Gemini для соблюдения минутного лимита Free Tier
+            print(f" -> Скачивание документации и экспертиза Gemini для {tender_ua_id}...")
             docs_text, pdf_parts = extract_all_attachments(tender.get("documents", []))
             ai_verdict = analyze_tender_with_gemini(tender, docs_text, pdf_parts)
+            gemini_used += 1
 
             if ai_verdict.get("is_relevant"):
                 print(f" -> ПОДТВЕРЖДЕН НАЛИВ! Отправка в Google Sheets и Telegram: {tender_ua_id}")
@@ -574,69 +630,41 @@ def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
             mark_as_processed(t_id)
             mark_as_processed(tender_ua_id)
         except Exception as e:
-            print(f" -> Ошибка при анализе {tender_ua_id} (добавлен в очередь гарантированного повтора): {e}")
+            gemini_used += 1
+            print(f" -> Временная перегрузка ИИ на {tender_ua_id} (сохранен в очередь retry_queue): {e}")
             add_to_retry_queue(t_id)
 
-    return matched_budget, matched_fuel_cpv, sent_to_crm
+    return matched_budget, matched_fuel_cpv, sent_to_crm, gemini_used
 
-# 14. Одноразовая точечная допроверка дневного среза 20 октября
-def recover_oct20_daytime_slice_if_needed() -> tuple[int, int, int, int]:
-    if get_sync_val("oct20_daytime_recovered") == "1":
-        return 0, 0, 0, 0
-
-    print("=== Допроверка дневного среза 20.10.2026 ===")
-    url = f"{PROZORRO_API_BASE}/tenders?offset=2026-10-20T00:00:00+03:00&limit=100&opt_fields=status"
-    candidate_ids = []
-    scanned = 0
-
-    for _ in range(220):
-        if not url:
-            break
-        resp = http_session.get(url, timeout=15).json()
-        data = resp.get("data", [])
-        if not data:
-            break
-        last_ts = data[-1].get("dateModified", "")
-        for item in data:
-            scanned += 1
-            tid = item.get("id")
-            st = item.get("status", "")
-            if st in ("active.enquiries", "active.tendering") and not is_already_processed(tid):
-                candidate_ids.append(tid)
-        if last_ts > "2026-10-20T20:30:00":
-            break
-        url = resp.get("next_page", {}).get("uri")
-
-    print(f"Найдено непроверенных активных карточек за 20.10.2026: {len(candidate_ids)}")
-    b, f, s = evaluate_active_tenders(candidate_ids)
-    set_sync_val("oct20_daytime_recovered", "1")
-    return scanned, len(candidate_ids), b, s
-
-# 15. Главный цикл непрерывного мониторинга
+# 15. Быстрый главный цикл мониторинга (выполняется за 45-60 секунд)
 def run_monitoring():
     total_scanned = 0
     total_active = 0
     total_budget = 0
     total_fuel = 0
     total_sent = 0
+    gemini_left = MAX_GEMINI_ANALYSES_PER_RUN
 
+    # Шаг 0: Проверка очереди retry_queue (дозировано до 4 тендеров за запуск)
     retry_ids = get_retry_queue_ids()
     if retry_ids:
-        print(f"=== Повторная проверка отложенных тендеров из очереди retry_queue ({len(retry_ids)} шт.) ===")
-        rb, rf, rs = evaluate_active_tenders(retry_ids)
+        print(f"=== Проверка отложенных тендеров из очереди retry_queue ({len(retry_ids)} шт.) ===")
+        rb, rf, rs, g_used = evaluate_active_tenders(retry_ids, gemini_left)
+        gemini_left -= g_used
         total_active += len(retry_ids)
         total_budget += rb
         total_fuel += rf
         total_sent += rs
 
+    # Шаг 1: Проверка свежих изменений с вершины ленты Prozorro (до 15 страниц = ~1.5 часа)
     last_top_ts = get_sync_val("last_top_ts")
     new_top_ts = ""
     next_url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status"
     
     fresh_active_ids = []
-    max_head_pages = 60
+    max_head_pages = 15
 
-    print("=== ФАЗА 1: Проверка свежих изменений ленты Prozorro ===")
+    print("=== Проверка свежих изменений ленты Prozorro ===")
     for page in range(1, max_head_pages + 1):
         if not next_url:
             break
@@ -665,33 +693,25 @@ def run_monitoring():
         if reached_previous_window:
             print(f"Окно синхронизации сомкнуто со штампом прошлого запуска ({last_top_ts}) на стр. {page}.")
             break
-        if not last_top_ts and page >= 25:
-            if not get_sync_val("backfill_next_url") and next_url:
-                set_sync_val("backfill_next_url", next_url)
-            break
 
     if new_top_ts:
         set_sync_val("last_top_ts", new_top_ts)
 
     print(f"Найдено свежих активных тендеров: {len(fresh_active_ids)}")
-    b1, f1, s1 = evaluate_active_tenders(fresh_active_ids)
+    b1, f1, s1, _ = evaluate_active_tenders(fresh_active_ids, gemini_left)
     total_active += len(fresh_active_ids)
     total_budget += b1
     total_fuel += f1
     total_sent += s1
 
-    sc2, ac2, b2, s2 = recover_oct20_daytime_slice_if_needed()
-    total_scanned += sc2
-    total_active += ac2
-    total_budget += b2
-    total_sent += s2
-
+    remaining_in_queue = len(get_retry_queue_ids())
     print("=========================================")
     print("ИТОГИ ЦИКЛА МОНИТОРИНГА:")
     print(f"- Всего просмотрено записей в ленте: {total_scanned}")
     print(f"- Из них проверено активных карточек: {total_active}")
     print(f"- Активных тендеров с бюджетом >= 2.4 млн грн: {total_budget}")
     print(f"- Подтверждено наливом и отправлено в Telegram: {total_sent}")
+    print(f"- Осталось в очереди retry_queue на следующий цикл: {remaining_in_queue}")
     print("=========================================")
 
 if __name__ == "__main__":
