@@ -26,13 +26,15 @@ PROZORRO_API_BASE = "https://public-api.prozorro.gov.ua/api/2.5"
 MIN_AMOUNT_UAH = 2400000
 TARGET_CPV_PREFIXES = ("09130000", "09132000", "09134200")
 
-# Дата начала глубокого ретроспективного поиска (захватывает все торги с 20 октября 2026)
+# Дата начала глубокого ретроспективного поиска (20 октября 2026)
 BACKFILL_TARGET_ISO = "2026-10-20T00:00:00"
 
-# Приоритетная проверка конкретных закупок (включая КП "КИЇВПАСТРАНС" и многолотовый тендер из лога #4)
-FORCE_CHECK_UA_IDS = (
-    "UA-2026-10-20-011345-a",
-    "UA-2026-10-22-006129-a",
+# Список актуальных моделей Gemini (основная gemini-3.0-flash + резервные на случай обновлений API)
+GEMINI_MODELS_FALLBACK = (
+    "gemini-3.0-flash",
+    "gemini-3-flash-preview",
+    "gemini-flash-latest",
+    "gemini-2.5-pro",
 )
 
 # Справочник видов торгов Prozorro
@@ -58,10 +60,6 @@ conn = sqlite3.connect("processed_tenders.db")
 cursor = conn.cursor()
 cursor.execute("CREATE TABLE IF NOT EXISTS tenders (id TEXT PRIMARY KEY)")
 cursor.execute("CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, val TEXT)")
-conn.commit()
-
-# Удаляем из базы ошибочно отсеянный в запуске #4 многолотовый тендер, чтобы перепроверить его через ИИ
-cursor.execute("DELETE FROM tenders WHERE id IN ('UA-2026-10-22-006129-a', 'UA-2026-10-20-011345-a')")
 conn.commit()
 
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -135,7 +133,6 @@ def parse_old_doc_bytes(file_bytes: bytes, filename: str) -> str:
 def extract_all_attachments(documents_json: list) -> tuple[str, list]:
     latest_docs = {}
     for d in documents_json:
-        # Учитываем документы и всего тендера, и отдельных лотов/позиций
         if d.get("documentOf") not in ("tender", "lot", "item"):
             continue
         doc_id = d.get("id")
@@ -206,7 +203,7 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
     return "\n\n".join(extracted_texts), pdf_parts
 
-# 7. Когнитивная юридическая и коммерческая экспертиза через Gemini 2.5 Flash
+# 7. Когнитивная юридическая и коммерческая экспертиза через Gemini 3.0 Flash
 def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: list) -> dict:
     val = tender_data.get("value", {})
     budget_amount = val.get("amount", 0)
@@ -236,94 +233,104 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
     """
 
     contents = [prompt] + pdf_parts
-
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=(
-                "Ты — ведущий тендерный юрист и аналитик оптового поставщика нефтепродуктов в Украине. "
-                "Проанализируй паспорт закупки (включая Запит ціни пропозицій / Prozorro Market и Открытые торги), "
-                "электронные поля milestones/items/lots и прикрепленный проект договора/ТД.\n"
-                "КРИТЕРИЙ ОТБОРА (is_relevant = true):\n"
-                "1. Закупается дизельное топливо или бензины НАЛИВОМ — как АВТОМОБИЛЬНЫМ ТРАНСПОРТОМ "
-                "(бензовозами/автоцистернами в резервуары заказчика или самовывозом), так и ЖЕЛЕЗНОДОРОЖНЫМ ТРАНСПОРТОМ (вагон-цистернами).\n"
-                "2. ВАЖНО ДЛЯ МНОГОЛОТОВЫХ ТЕНДЕРОВ: Если в закупке несколько лотов, и хотя бы в одном лоте закупается дизельное топливо "
-                "или бензин НАЛИВОМ — обязательно верни is_relevant = true (и опиши именно наливные лоты)!\n"
-                "3. Верни is_relevant = false ТОЛЬКО в том случае, если во всех лотах закупаются исключительно талоны, топливные карты, "
-                "скретч-карты, бланки-разрешения или розничная заправка через сеть АЗС (либо не закупается ДТ/бензин).\n"
-                "Все ответы формируй на русском языке (прямые цитаты из украинского договора приводи дословно в кавычках с указанием номера пункта договора)."
-            ),
-            response_mime_type="application/json",
-            response_schema={
-                "type": "OBJECT",
-                "properties": {
-                    "is_relevant": {"type": "BOOLEAN"},
-                    "subject_and_procedure": {
-                        "type": "STRING",
-                        "description": "Пункт 2: Предмет закупки и точный вид торгов (например: Открытые торги с особенностями / Запрос ценовых предложений)"
-                    },
-                    "fuel_grade_and_volume": {
-                        "type": "STRING",
-                        "description": "Пункт 3: Марка топлива (ДП Евро-5, А-95 и т.д.) и точный объем с единицами измерения (тонны / кг / литры)"
-                    },
-                    "unit_price_calculation": {
-                        "type": "STRING",
-                        "description": "Пункт 4: Расчетная предельная цена за 1 единицу (литр/тонну/кг) с НДС (и без НДС, если бюджет указан без НДС) исходя из бюджета и объема"
-                    },
-                    "payment_terms": {
-                        "type": "STRING",
-                        "description": "Пункт 5: Условия оплаты (отсрочка в банковских/календарных днях, по факту поставки или предоплата)"
-                    },
-                    "is_formula_pricing": {
-                        "type": "BOOLEAN",
-                        "description": "true, если цена определяется формульным ценообразованием; false, если цена фиксированная"
-                    },
-                    "formula_details": {
-                        "type": "STRING",
-                        "description": "Пункт 6: Если цена формульная — точная математическая формула и описание всех ее коэффициентов согласно договору. Если фиксированная — напиши 'Цена фиксированная'"
-                    },
-                    "delivery_mode_and_location": {
-                        "type": "STRING",
-                        "description": "Пункт 8: Способ отгрузки (Автотранспорт / ЖД вагон-цистерны), базис Инкотермс (DDP/EXW/FCA/CPT) и точный адрес передачи товара или ж/д станция назначения"
-                    },
-                    "delivery_and_contract_term": {
-                        "type": "STRING",
-                        "description": "Пункт 9: Срок поставки отдельной партии по заявке (например, в течение 5 календарных дней), общий период поставки и срок действия договора"
-                    },
-                    "bid_security_uah": {
-                        "type": "STRING",
-                        "description": "Пункт 10: Обеспечение тендерного предложения — размер гарантии в сумме (грн), или 'Не требуется'"
-                    },
-                    "contract_security_details": {
-                        "type": "STRING",
-                        "description": "Пункт 11: Обеспечение выполнения договора — вид обеспечения (гарантия / депозит на счет заказчика) и размер в % от суммы договора, или 'Не требуется'"
-                    },
-                    "features_pitfalls_and_risks": {
-                        "type": "STRING",
-                        "description": "Для кнопки 'Особенности тендера' (Блок 1): Подводные камни по договору, особенности приемки и риски убытков поставщика с номерами пунктов и прямыми цитатами"
-                    },
-                    "features_penalties": {
-                        "type": "STRING",
-                        "description": "Для кнопки 'Особенности тендера' (Блок 2): Ответственность поставщика (штрафные санкции, пеня) — размер и за что вменяется, с номерами пунктов договора и прямыми цитатами"
-                    },
-                    "features_price_increase_rules": {
-                        "type": "STRING",
-                        "description": "Для кнопки 'Особенности тендера' (Блок 3): Условия повышения цены (на основании каких документов можно поднять цену, условия и ограничения) с номерами пунктов договора и прямыми цитатами"
-                    }
+    gen_config = types.GenerateContentConfig(
+        system_instruction=(
+            "Ты — ведущий тендерный юрист и аналитик оптового поставщика нефтепродуктов в Украине. "
+            "Проанализируй паспорт закупки (включая Запит ціни пропозицій / Prozorro Market и Открытые торги), "
+            "электронные поля milestones/items/lots и прикрепленный проект договора/ТД.\n"
+            "КРИТЕРИЙ ОТБОРА (is_relevant = true):\n"
+            "1. Закупается дизельное топливо или бензины НАЛИВОМ — как АВТОМОБИЛЬНЫМ ТРАНСПОРТОМ "
+            "(бензовозами/автоцистернами в резервуары заказчика или самовывозом), так и ЖЕЛЕЗНОДОРОЖНЫМ ТРАНСПОРТОМ (вагон-цистернами).\n"
+            "2. ВАЖНО ДЛЯ МНОГОЛОТОВЫХ ТЕНДЕРОВ: Если в закупке несколько лотов, и хотя бы в одном лоте закупается дизельное топливо "
+            "или бензин НАЛИВОМ — обязательно верни is_relevant = true (и опиши именно наливные лоты)!\n"
+            "3. Верни is_relevant = false ТОЛЬКО в том случае, если во всех лотах закупаются исключительно талоны, топливные карты, "
+            "скретч-карты, бланки-разрешения или розничная заправка через сеть АЗС (либо не закупается ДТ/бензин).\n"
+            "Все ответы формируй на русском языке (прямые цитаты из украинского договора приводи дословно в кавычках с указанием номера пункта договора)."
+        ),
+        response_mime_type="application/json",
+        response_schema={
+            "type": "OBJECT",
+            "properties": {
+                "is_relevant": {"type": "BOOLEAN"},
+                "subject_and_procedure": {
+                    "type": "STRING",
+                    "description": "Пункт 2: Предмет закупки и точный вид торгов (например: Открытые торги с особенностями / Запрос ценовых предложений)"
                 },
-                "required": [
-                    "is_relevant", "subject_and_procedure", "fuel_grade_and_volume",
-                    "unit_price_calculation", "payment_terms", "is_formula_pricing",
-                    "formula_details", "delivery_mode_and_location", "delivery_and_contract_term",
-                    "bid_security_uah", "contract_security_details",
-                    "features_pitfalls_and_risks", "features_penalties", "features_price_increase_rules"
-                ]
+                "fuel_grade_and_volume": {
+                    "type": "STRING",
+                    "description": "Пункт 3: Марка топлива (ДП Евро-5, А-95 и т.д.) и точный объем с единицами измерения (тонны / кг / литры)"
+                },
+                "unit_price_calculation": {
+                    "type": "STRING",
+                    "description": "Пункт 4: Расчетная предельная цена за 1 единицу (литр/тонну/кг) с НДС (и без НДС, если бюджет указан без НДС) исходя из бюджета и объема"
+                },
+                "payment_terms": {
+                    "type": "STRING",
+                    "description": "Пункт 5: Условия оплаты (отсрочка в банковских/календарных днях, по факту поставки или предоплата)"
+                },
+                "is_formula_pricing": {
+                    "type": "BOOLEAN",
+                    "description": "true, если цена определяется формульным ценообразованием; false, если цена фиксированная"
+                },
+                "formula_details": {
+                    "type": "STRING",
+                    "description": "Пункт 6: Если цена формульная — точная математическая формула и описание всех ее коэффициентов согласно договору. Если фиксированная — напиши 'Цена фиксированная'"
+                },
+                "delivery_mode_and_location": {
+                    "type": "STRING",
+                    "description": "Пункт 8: Способ отгрузки (Автотранспорт / ЖД вагон-цистерны), базис Инкотермс (DDP/EXW/FCA/CPT) и точный адрес передачи товара или ж/д станция назначения"
+                },
+                "delivery_and_contract_term": {
+                    "type": "STRING",
+                    "description": "Пункт 9: Срок поставки отдельной партии по заявке (например, в течение 5 календарных дней), общий период поставки и срок действия договора"
+                },
+                "bid_security_uah": {
+                    "type": "STRING",
+                    "description": "Пункт 10: Обеспечение тендерного предложения — размер гарантии в сумме (грн), или 'Не требуется'"
+                },
+                "contract_security_details": {
+                    "type": "STRING",
+                    "description": "Пункт 11: Обеспечение выполнения договора — вид обеспечения (гарантия / депозит на счет заказчика) и размер в % от суммы договора, или 'Не требуется'"
+                },
+                "features_pitfalls_and_risks": {
+                    "type": "STRING",
+                    "description": "Для кнопки 'Особенности тендера' (Блок 1): Подводные камни по договору, особенности приемки и риски убытков поставщика с номерами пунктов и прямыми цитатами"
+                },
+                "features_penalties": {
+                    "type": "STRING",
+                    "description": "Для кнопки 'Особенности тендера' (Блок 2): Ответственность поставщика (штрафные санкции, пеня) — размер и за что вменяется, с номерами пунктов договора и прямыми цитатами"
+                },
+                "features_price_increase_rules": {
+                    "type": "STRING",
+                    "description": "Для кнопки 'Особенности тендера' (Блок 3): Условия повышения цены (на основании каких документов можно поднять цену, условия и ограничения) с номерами пунктов договора и прямыми цитатами"
+                }
             },
-            temperature=0.0
-        )
+            "required": [
+                "is_relevant", "subject_and_procedure", "fuel_grade_and_volume",
+                "unit_price_calculation", "payment_terms", "is_formula_pricing",
+                "formula_details", "delivery_mode_and_location", "delivery_and_contract_term",
+                "bid_security_uah", "contract_security_details",
+                "features_pitfalls_and_risks", "features_penalties", "features_price_increase_rules"
+            ]
+        },
+        temperature=0.0
     )
-    return json.loads(response.text)
+
+    last_err = None
+    for model_name in GEMINI_MODELS_FALLBACK:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=gen_config
+            )
+            return json.loads(response.text)
+        except Exception as err:
+            last_err = err
+            if "404" in str(err) or "NOT_FOUND" in str(err):
+                continue
+            raise err
+    raise last_err
 
 # 8. Сборка карточки из 12 пунктов и передача в Google Sheets CRM
 def dispatch_to_crm(tender_data: dict, ai: dict):
@@ -368,7 +375,7 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
         f"<b>11) Обеспечение договора:</b> {html.escape(ai['contract_security_details'])}\n\n"
         f"<b>12) Ссылка на SmartTender.biz:</b> <a href=\"{html.escape(smarttender_url)}\">{html.escape(smarttender_url)}</a>\n"
         f"-----------------------------------------\n"
-        f"<i>Ответьте (Reply) свободным текстом на это сообщение, чтобы ИИ внес вашу цену, статус или результат в таблицу.</i>"
+        f"<i>Ответьте (Reply) свободным текстом на это сообщение, чтобы ИИ внес вашу цену, статус или результат в таблицу (или напишите /boss для акцента руководителю).</i>"
     )
 
     features_detailed_text = (
@@ -406,7 +413,6 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     resp = http_session.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
     print(f" -> Ответ Google Таблицы: {resp.text[:120]}")
 
-# Загрузка полной карточки тендера
 def fetch_tender_detail(t_id: str) -> dict:
     try:
         r = http_session.get(f"{PROZORRO_API_BASE}/tenders/{t_id}", timeout=12)
@@ -416,7 +422,6 @@ def fetch_tender_detail(t_id: str) -> dict:
         pass
     return {}
 
-# Обработка списка карточек: фильтрация бюджета >= 2.4 млн и кодов ДК 0913... + запуск Gemini
 def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
     matched_budget = 0
     matched_fuel_cpv = 0
@@ -431,7 +436,6 @@ def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
             if not tender:
                 continue
 
-            ua_id = tender.get("tenderID", tid)
             status = tender.get("status", "")
             if status not in ("active.enquiries", "active.tendering"):
                 mark_as_processed(tid)
@@ -463,7 +467,7 @@ def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
         print(f"Топливный тендер >= 2.4 млн: {tender_ua_id} | {amount:,.2f} грн | {tender.get('title', '')[:70]}")
 
         try:
-            print(f" -> Скачивание документации и экспертиза Gemini для {tender_ua_id}...")
+            print(f" -> Скачивание документации и экспертиза Gemini 3.0 Flash для {tender_ua_id}...")
             docs_text, pdf_parts = extract_all_attachments(tender.get("documents", []))
             ai_verdict = analyze_tender_with_gemini(tender, docs_text, pdf_parts)
 
@@ -481,7 +485,7 @@ def evaluate_active_tenders(active_ids: list) -> tuple[int, int, int]:
 
     return matched_budget, matched_fuel_cpv, sent_to_crm
 
-# 9. Главный цикл непрерывного мониторинга с курсором синхронизации и докачкой истории с 20 октября
+# 9. Главный цикл непрерывного мониторинга
 def run_monitoring():
     total_scanned = 0
     total_active = 0
@@ -489,13 +493,12 @@ def run_monitoring():
     total_fuel = 0
     total_sent = 0
 
-    # ФАЗА 1: Чтение новых изменений с вершины ленты до смыкания с прошлым запуском
     last_top_ts = get_sync_val("last_top_ts")
     new_top_ts = ""
     next_url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status"
     
     fresh_active_ids = []
-    max_head_pages = 60  # До 6000 свежих записей для гарантированного перекрытия между запусками
+    max_head_pages = 60
 
     print("=== ФАЗА 1: Проверка свежих изменений ленты Prozorro ===")
     for page in range(1, max_head_pages + 1):
@@ -527,7 +530,6 @@ def run_monitoring():
             print(f"Окно синхронизации сомкнуто со штампом прошлого запуска ({last_top_ts}) на стр. {page}.")
             break
         if not last_top_ts and page >= 25:
-            # Если это самый первый запуск с курсором, передаем эстафету в Фазу 2 (глубокий Backfill)
             if not get_sync_val("backfill_next_url") and next_url:
                 set_sync_val("backfill_next_url", next_url)
             break
@@ -542,14 +544,14 @@ def run_monitoring():
     total_fuel += f1
     total_sent += s1
 
-    # ФАЗА 2: Автоматическая докачка истории вглубь до 20.10.2026 (включая КП "КИЇВПАСТРАНС")
+    # ФАЗА 2: Автоматическая докачка истории вглубь до 20.10.2026
     backfill_done = get_sync_val("backfill_done_2026_10_20")
     backfill_url = get_sync_val("backfill_next_url")
 
     if not backfill_done and backfill_url:
         print(f"=== ФАЗА 2: Докачка истории торгов вглубь до {BACKFILL_TARGET_ISO} ===")
         backfill_active_ids = []
-        max_backfill_pages = 120  # Проверяем по 12 000 исторических записей за один цикл
+        max_backfill_pages = 180  # Увеличено до 18 000 записей за цикл, чтобы сразу дойти до 20 октября
 
         for b_page in range(1, max_backfill_pages + 1):
             if not backfill_url:
