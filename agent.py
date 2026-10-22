@@ -350,45 +350,85 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
 
     requests.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
 
-# 8. Главный цикл мониторинга Prozorro
+# 8. Главный цикл мониторинга Prozorro (с пагинацией на 15 страниц = 1500 тендеров)
 def run_monitoring():
-    url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status,value"
-    resp = requests.get(url, timeout=15).json()
+    next_url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status,value"
+    pages_to_scan = 15  # Проверяем 1500 последних тендеров в ленте Prozorro
+    
+    total_scanned = 0
+    matched_budget = 0
+    matched_fuel_cpv = 0
+    sent_to_crm = 0
 
-    for item in resp.get("data", []):
-        t_id = item["id"]
-        status = item.get("status", "")
-        amount = item.get("value", {}).get("amount", 0)
+    for page in range(1, pages_to_scan + 1):
+        if not next_url:
+            break
+            
+        print(f"Чтение страницы {page}/{pages_to_scan} ленты Prozorro...")
+        resp = requests.get(next_url, timeout=15).json()
+        items_list = resp.get("data", [])
+        next_url = resp.get("next_page", {}).get("uri")
 
-        if status not in ("active.enquiries", "active.tendering") or amount < MIN_AMOUNT_UAH:
-            continue
-        if is_already_processed(t_id):
-            continue
+        for item in items_list:
+            total_scanned += 1
+            t_id = item["id"]
+            status = item.get("status", "")
+            amount = item.get("value", {}).get("amount", 0)
 
-        detail_resp = requests.get(f"{PROZORRO_API_BASE}/tenders/{t_id}", timeout=15).json()
-        tender = detail_resp.get("data", {})
+            # 1. Фильтр по статусу и бюджету от 3 млн грн
+            if status not in ("active.enquiries", "active.tendering") or amount < MIN_AMOUNT_UAH:
+                continue
+            if is_already_processed(t_id):
+                continue
 
-        items = tender.get("items", [])
-        has_fuel_cpv = any(
-            i.get("classification", {}).get("id", "").startswith(TARGET_CPV_PREFIXES)
-            for i in items
-        )
-        if not has_fuel_cpv:
+            matched_budget += 1
+
+            # 2. Загрузка полной карточки тендера
+            detail_resp = requests.get(f"{PROZORRO_API_BASE}/tenders/{t_id}", timeout=15).json()
+            tender = detail_resp.get("data", {})
+            tender_ua_id = tender.get("tenderID", t_id)
+
+            # 3. Фильтр по кодам ДК 021:2015 (Нефть, бензин, дизельное топливо)
+            items = tender.get("items", [])
+            has_fuel_cpv = any(
+                i.get("classification", {}).get("id", "").startswith(TARGET_CPV_PREFIXES)
+                for i in items
+            )
+            if not has_fuel_cpv:
+                mark_as_processed(t_id)
+                continue
+
+            matched_fuel_cpv += 1
+            full_title = f"{tender.get('title', '')} {tender.get('description', '')}"
+            print(f"Найден топливный тендер >= 3 млн: {tender_ua_id} | {amount:,.2f} грн | {tender.get('title', '')[:60]}")
+
+            # 4. Быстрый отсев явных талонов и карт в заголовке
+            if STOP_WORDS_REGEX.search(full_title):
+                print(f" -> Отсеян по стоп-словам (талоны/карты/АЗС) в заголовке: {tender_ua_id}")
+                mark_as_processed(t_id)
+                continue
+
+            # 5. Выгрузка документации и глубокий анализ через Gemini API
+            print(f" -> Скачивание вложений и запуск экспертизы Gemini для {tender_ua_id}...")
+            docs_text, pdf_parts = extract_all_attachments(tender.get("documents", []))
+            ai_verdict = analyze_tender_with_gemini(tender, docs_text, pdf_parts)
+
+            if ai_verdict.get("is_relevant"):
+                print(f" -> ПОДТВЕРЖДЕН НАЛИВ! Отправка в Google Sheets и Telegram: {tender_ua_id}")
+                dispatch_to_crm(tender, ai_verdict)
+                sent_to_crm += 1
+            else:
+                print(f" -> Отклонен ИИ после чтения ТД (не налив): {tender_ua_id}")
+
             mark_as_processed(t_id)
-            continue
 
-        full_title = f"{tender.get('title', '')} {tender.get('description', '')}"
-        if STOP_WORDS_REGEX.search(full_title):
-            mark_as_processed(t_id)
-            continue
-
-        docs_text, pdf_parts = extract_all_attachments(tender.get("documents", []))
-        ai_verdict = analyze_tender_with_gemini(tender, docs_text, pdf_parts)
-
-        if ai_verdict.get("is_relevant"):
-            dispatch_to_crm(tender, ai_verdict)
-
-        mark_as_processed(t_id)
+    print("=========================================")
+    print(f"ИТОГИ ЦИКЛА МОНИТОРИНГА:")
+    print(f"- Всего просмотрено тендеров в ленте: {total_scanned}")
+    print(f"- Активных тендеров с бюджетом >= 3 млн грн: {matched_budget}")
+    print(f"- Из них по кодам топлива (0913...): {matched_fuel_cpv}")
+    print(f"- Подтверждено наливом и отправлено в Telegram: {sent_to_crm}")
+    print("=========================================")
 
 if __name__ == "__main__":
     run_monitoring()
