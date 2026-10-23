@@ -38,9 +38,9 @@ EXCLUDED_CPV_PREFIXES = ("09131", "09133", "09135")
 MAX_GEMINI_ANALYSES_PER_RUN = 15
 
 GEMINI_MODELS_FALLBACK = (
-    "gemini-3.0-flash",
+    "gemini-2.5-flash",
     "gemini-3-flash-preview",
-    "gemini-flash-latest",
+    "gemini-3.0-flash",
     "gemini-3.1-pro-preview",
 )
 
