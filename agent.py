@@ -21,7 +21,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
 # 1. Конфигурация ключей из GitHub Secrets
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GOOGLE_WEB_APP_URL = os.environ.get("GOOGLE_WEB_APP_URL")
 SECRET_BRIDGE_KEY = os.environ.get("SECRET_BRIDGE_KEY", "FUEL_TENDER_SECRET_2026")
 
@@ -31,17 +31,16 @@ PROZORRO_API_BASE = "https://public-api.prozorro.gov.ua/api/2.5"
 MIN_AMOUNT_UAH = 2400000
 
 # Коды ДК 021:2015: общая группа 09130000, бензины 09132..., дизельное топливо 09134...
-# (Код 09131... авиационный керосин и 09133... сжиженный газ исключены на уровне префиксов)
 TARGET_CPV_PREFIXES = ("09130000", "09132", "09134")
 EXCLUDED_CPV_PREFIXES = ("09131", "09133", "09135")
 
 MAX_GEMINI_ANALYSES_PER_RUN = 15
 
+# Модели в Vertex AI (us-central1 / global)
 GEMINI_MODELS_FALLBACK = (
     "gemini-2.5-flash",
-    "gemini-3-flash-preview",
-    "gemini-3.0-flash",
-    "gemini-3.1-pro-preview",
+    "gemini-2.0-flash",
+    "gemini-2.5-pro",
 )
 
 # Жесткий фильтр исключения: керосин (гас), авиатопливо (JET A-1, РТ, ТС-1), газ, сжиженный газ, мазут, масла
@@ -89,7 +88,7 @@ adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retries)
 http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
 
-# 3. База данных проверенных тендеров
+# 3. База данных проверенных тендеров и инициализация клиента Vertex AI
 conn = sqlite3.connect("processed_tenders.db")
 cursor = conn.cursor()
 cursor.execute("CREATE TABLE IF NOT EXISTS tenders (id TEXT PRIMARY KEY)")
@@ -97,11 +96,32 @@ cursor.execute("CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, val
 cursor.execute("CREATE TABLE IF NOT EXISTS retry_queue (id TEXT PRIMARY KEY)")
 conn.commit()
 
-# Удаляем из очереди авиационный тендер JET A-1 (UA-2026-10-23-004773-a)
 cursor.execute("DELETE FROM retry_queue WHERE id LIKE '%004773%'")
 conn.commit()
 
-client = genai.Client(vertexai=True, api_key=GEMINI_API_KEY)
+if GEMINI_API_KEY.startswith("{"):
+    creds_info = json.loads(GEMINI_API_KEY)
+    project_id = creds_info.get("project_id", "ultra-dominion-510720-s6")
+    if creds_info.get("type") == "service_account":
+        from google.oauth2 import service_account
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+    else:
+        from google.oauth2.credentials import Credentials
+        creds = Credentials.from_authorized_user_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+    client = genai.Client(
+        vertexai=True,
+        project=project_id,
+        location="us-central1",
+        credentials=creds
+    )
+else:
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
 def is_already_processed(tender_id: str) -> bool:
     cursor.execute("SELECT 1 FROM tenders WHERE id = ?", (tender_id,))
@@ -134,7 +154,6 @@ def is_valid_diesel_or_gasoline_tender(tender: dict) -> tuple[bool, str]:
     title_and_desc = f"{tender.get('title', '')} {tender.get('description', '')}"
     items = tender.get("items", [])
 
-    # Проверяем каждую позицию номенклатуры
     valid_fuel_items = []
     for item in items:
         cpv = str(item.get("classification", {}).get("id", ""))
@@ -144,7 +163,6 @@ def is_valid_diesel_or_gasoline_tender(tender: dict) -> tuple[bool, str]:
             continue
         if not cpv.startswith(TARGET_CPV_PREFIXES):
             continue
-        # Если в описании конкретной позиции указан гас, газ, JET A-1, авиатопливо — пропускаем позицию
         if EXCLUDED_FUEL_REGEX.search(item_desc) and not MANDATORY_FUEL_REGEX.search(item_desc):
             continue
         valid_fuel_items.append(item_desc)
@@ -155,11 +173,9 @@ def is_valid_diesel_or_gasoline_tender(tender: dict) -> tuple[bool, str]:
     combined_items_text = " ".join(valid_fuel_items)
     full_check_text = f"{title_and_desc} {combined_items_text}"
 
-    # Если заголовок тендера явно посвящен керосину (гас), газу или авиатопливу JET A-1 без бензина/ДТ
     if EXCLUDED_FUEL_REGEX.search(full_check_text) and not MANDATORY_FUEL_REGEX.search(combined_items_text):
         return False, "Отсеян по стоп-словам (гас / газ / авиатопливо JET A-1)"
 
-    # Обязательное наличие слов бензин / дизельне паливо / ДП
     if not MANDATORY_FUEL_REGEX.search(full_check_text):
         return False, "Не найдено упоминаний бензина или дизельного топлива"
 
@@ -228,7 +244,6 @@ def calculate_budget_with_vat_verified(tender_data: dict, ai: dict, docs_text: s
     budget_raw = float(val.get("amount", 0) or 0)
     prozorro_vat_included = bool(val.get("valueAddedTaxIncluded", False))
 
-    # Проверяем, применяется ли ставка НДС 0% (или без НДС) по договору/ТД
     ai_vat_rate = ai.get("vat_rate_percent", 20)
     is_zero_vat = (ai_vat_rate == 0) or bool(ZERO_VAT_REGEX.search(docs_text))
 
@@ -236,7 +251,6 @@ def calculate_budget_with_vat_verified(tender_data: dict, ai: dict, docs_text: s
         multiplier = 1.0
         vat_label = "с НДС (0%)"
     else:
-        # Если ставка 20%: умножаем на 1.2 только если в Prozorro бюджет указан БЕЗ НДС
         multiplier = 1.0 if prozorro_vat_included else 1.2
         vat_label = "с НДС"
 
@@ -248,7 +262,6 @@ def calculate_budget_with_vat_verified(tender_data: dict, ai: dict, docs_text: s
     ]
     target_items = fuel_items if fuel_items else items
 
-    # Если в закупке (или лоте) 1 позиция товара — считаем цену за 1 единицу с НДС
     if len(target_items) == 1:
         qty = float(target_items[0].get("quantity", 0) or 0)
         unit_raw = str(target_items[0].get("unit", {}).get("name", "ед.")).lower()
@@ -379,7 +392,7 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
     return "\n\n".join(extracted_texts), pdf_parts
 
-# 12. Когнитивная экспертиза через Gemini
+# 12. Когнитивная экспертиза через Gemini (Vertex AI)
 def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: list) -> dict:
     val = tender_data.get("value", {})
     budget_amount = val.get("amount", 0)
@@ -522,7 +535,6 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str):
     method_type = tender_data.get("procurementMethodType", "")
     procedure_clean = PROCUREMENT_METHODS.get(method_type, "Открытые торги")
 
-    # Расчет бюджета с предварительной проверкой ставки НДС (0% или 20%)
     budget_display_str = calculate_budget_with_vat_verified(tender_data, ai, docs_text)
 
     raw_end_date = tender_data.get("tenderPeriod", {}).get("endDate", "")
@@ -551,7 +563,6 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str):
     else:
         pricing_html = "Цена фиксированная"
 
-    # Новый формат уведомления для Админа, Руководителей и Зрителей
     card_html = (
         f"<b>Тендер:</b> <code>{html.escape(tender_ua_id)}</code> ({html.escape(procedure_clean)})\n"
         f"-----------------------------------------\n"
@@ -608,8 +619,7 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str):
     resp = http_session.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
     print(f" -> Ответ Google Таблицы: {resp.text[:120]}")
 
-# 14. Проверка результатов торгов (победитель / акцепт / самая низкая цена в ЗЦП)
-# ТОЛЬКО для тендеров, где была нажата кнопка "Принимаем участие"
+# 14. Проверка результатов торгов по тендерам «Принимаем участие»
 def check_results_for_participating_tenders():
     try:
         req_payload = {
@@ -645,7 +655,6 @@ def check_results_for_participating_tenders():
             winner_edrpou = ""
             price_str = ""
 
-            # 1. Проверяем наличие официального победителя / акцепта (award.status == "active")
             active_awards = [a for a in awards if a.get("status") == "active"]
             pending_awards = [a for a in awards if a.get("status") == "pending"]
 
@@ -661,7 +670,6 @@ def check_results_for_participating_tenders():
                 event_stage = f"active_award_{aw.get('id', '')}"
                 event_title = "АКЦЕПТ / ПРИЗНАН ПОБЕДИТЕЛЬ ТЕНДЕРА"
 
-            # 2. Если акцепта еще нет, проверяем кандидата с самой дешевой ценой на квалификации (award.status == "pending")
             elif pending_awards:
                 aw = pending_awards[-1]
                 supp = (aw.get("suppliers") or [{}])[0]
@@ -677,7 +685,6 @@ def check_results_for_participating_tenders():
                 else:
                     event_title = "ОПРЕДЕЛЕН ЛИДЕР С НАИМЕНЬШЕЙ ЦЕНОЙ (КВАЛИФИКАЦИЯ)"
 
-            # 3. Дополнительно проверяем раскрытые предложения (bids), если awards еще не сформирован
             elif bids:
                 valid_bids = [
                     b for b in bids
@@ -758,7 +765,6 @@ def evaluate_active_tenders(active_ids: list, gemini_budget_left: int) -> tuple[
 
             matched_budget += 1
 
-            # Проверяем, что это именно бензин или дизельное топливо (без гаса, газа и JET A-1)
             is_valid_fuel, _ = is_valid_diesel_or_gasoline_tender(tender)
             if not is_valid_fuel:
                 mark_as_processed(tid)
@@ -787,7 +793,7 @@ def evaluate_active_tenders(active_ids: list, gemini_budget_left: int) -> tuple[
         try:
             if gemini_used > 0:
                 time.sleep(2)
-            print(f" -> Скачивание документации и экспертиза Gemini для {tender_ua_id}...")
+            print(f" -> Скачивание документации и экспертиза Gemini (Vertex AI) для {tender_ua_id}...")
             docs_text, pdf_parts = extract_all_attachments(tender.get("documents", []))
             ai_verdict = analyze_tender_with_gemini(tender, docs_text, pdf_parts)
             gemini_used += 1
@@ -817,7 +823,6 @@ def run_monitoring():
     total_sent = 0
     gemini_left = MAX_GEMINI_ANALYSES_PER_RUN
 
-    # Шаг 0: Проверка очереди retry_queue
     retry_ids = get_retry_queue_ids()
     if retry_ids:
         print(f"=== Проверка отложенных тендеров из очереди retry_queue ({len(retry_ids)} шт.) ===")
@@ -828,7 +833,6 @@ def run_monitoring():
         total_fuel += rf
         total_sent += rs
 
-    # Шаг 1: Проверка свежих изменений ленты Prozorro
     last_top_ts = get_sync_val("last_top_ts")
     new_top_ts = ""
     next_url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status"
@@ -876,7 +880,6 @@ def run_monitoring():
     total_fuel += f1
     total_sent += s1
 
-    # Шаг 2: Проверка победителей / акцептов по тем тендерам, где нажата кнопка "Принимаем участие"
     check_results_for_participating_tenders()
 
     remaining_in_queue = len(get_retry_queue_ids())
