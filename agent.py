@@ -36,11 +36,13 @@ EXCLUDED_CPV_PREFIXES = ("09131", "09133", "09135")
 
 MAX_GEMINI_ANALYSES_PER_RUN = 15
 
-# Модели в Vertex AI (us-central1 / global)
+# Актуальная линейка моделей Gemini 3 для новых проектов в Vertex AI
 GEMINI_MODELS_FALLBACK = (
+    "gemini-3-flash-preview",
+    "gemini-3.0-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite-preview",
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-pro",
 )
 
 # Жесткий фильтр исключения: керосин (гас), авиатопливо (JET A-1, РТ, ТС-1), газ, сжиженный газ, мазут, масла
@@ -88,7 +90,7 @@ adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retries)
 http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
 
-# 3. База данных проверенных тендеров и инициализация клиента Vertex AI
+# 3. База данных проверенных тендеров и инициализация клиентов Vertex AI (global + us-central1)
 conn = sqlite3.connect("processed_tenders.db")
 cursor = conn.cursor()
 cursor.execute("CREATE TABLE IF NOT EXISTS tenders (id TEXT PRIMARY KEY)")
@@ -99,6 +101,7 @@ conn.commit()
 cursor.execute("DELETE FROM retry_queue WHERE id LIKE '%004773%'")
 conn.commit()
 
+vertex_clients = []
 if GEMINI_API_KEY.startswith("{"):
     creds_info = json.loads(GEMINI_API_KEY)
     project_id = creds_info.get("project_id", "ultra-dominion-510720-s6")
@@ -114,14 +117,19 @@ if GEMINI_API_KEY.startswith("{"):
             creds_info,
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
-    client = genai.Client(
-        vertexai=True,
-        project=project_id,
-        location="us-central1",
-        credentials=creds
-    )
+    # В Vertex AI модели Gemini 3.x размещены на глобальном шлюзе location="global"
+    for loc in ("global", "us-central1"):
+        vertex_clients.append((
+            loc,
+            genai.Client(
+                vertexai=True,
+                project=project_id,
+                location=loc,
+                credentials=creds
+            )
+        ))
 else:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    vertex_clients.append(("ai_studio", genai.Client(api_key=GEMINI_API_KEY)))
 
 def is_already_processed(tender_id: str) -> bool:
     cursor.execute("SELECT 1 FROM tenders WHERE id = ?", (tender_id,))
@@ -392,7 +400,7 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
     return "\n\n".join(extracted_texts), pdf_parts
 
-# 12. Когнитивная экспертиза через Gemini (Vertex AI)
+# 12. Когнитивная экспертиза через Gemini (Vertex AI global / us-central1)
 def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: list) -> dict:
     val = tender_data.get("value", {})
     budget_amount = val.get("amount", 0)
@@ -502,27 +510,30 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
         temperature=0.0
     )
 
-    primary_err = None
-    for model_name in GEMINI_MODELS_FALLBACK:
-        for attempt in range(2):
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=gen_config
-                )
-                return json.loads(response.text)
-            except Exception as err:
-                err_str = str(err)
-                if primary_err is None and "404" not in err_str:
-                    primary_err = err
-                if "404" in err_str or "NOT_FOUND" in err_str:
+    last_err = None
+    for loc_name, v_client in vertex_clients:
+        for model_name in GEMINI_MODELS_FALLBACK:
+            for attempt in range(2):
+                try:
+                    response = v_client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=gen_config
+                    )
+                    print(f" -> Успешный ответ от модели {model_name} (шлюз: {loc_name})")
+                    return json.loads(response.text)
+                except Exception as err:
+                    last_err = err
+                    err_str = str(err)
+                    if "404" in err_str or "NOT_FOUND" in err_str:
+                        break
+                    if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                        time.sleep(3 * (attempt + 1))
+                        continue
+                    print(f" -> Ответ шлюза {loc_name}/{model_name}: {err_str[:200]}")
                     break
-                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                    time.sleep(4 * (attempt + 1))
-                    continue
-                break
-    raise (primary_err or Exception("Все модели Gemini временно недоступны"))
+
+    raise (last_err or Exception("Не удалось получить ответ от моделей Gemini"))
 
 # 13. Сборка карточки в новом формате и передача в Google Sheets CRM
 def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str):
