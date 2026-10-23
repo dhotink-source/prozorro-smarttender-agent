@@ -17,7 +17,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from google import genai
 from google.genai import types
 
-# Мгновенный вывод каждой строки в лог GitHub Actions без буферизации
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -28,27 +27,49 @@ SECRET_BRIDGE_KEY = os.environ.get("SECRET_BRIDGE_KEY", "FUEL_TENDER_SECRET_2026
 
 PROZORRO_API_BASE = "https://public-api.prozorro.gov.ua/api/2.5"
 
-# Порог бюджета: 2,4 млн грн (2 400 000 грн)
+# Порог бюджета: 2,4 млн грн
 MIN_AMOUNT_UAH = 2400000
-TARGET_CPV_PREFIXES = ("09130000", "09132000", "09134200")
 
-# На коммерческом тарифе Tier 1 обрабатываем до 30 тендеров за один цикл без очередей
-MAX_GEMINI_ANALYSES_PER_RUN = 30
+# Коды ДК 021:2015: общая группа 09130000, бензины 09132..., дизельное топливо 09134...
+# (Код 09131... авиационный керосин и 09133... сжиженный газ исключены на уровне префиксов)
+TARGET_CPV_PREFIXES = ("09130000", "09132", "09134")
+EXCLUDED_CPV_PREFIXES = ("09131", "09133", "09135")
 
-# Актуальный список моделей для коммерческого тарифа Tier 1
+MAX_GEMINI_ANALYSES_PER_RUN = 15
+
 GEMINI_MODELS_FALLBACK = (
     "gemini-3.0-flash",
-    "gemini-3.1-pro-preview",
     "gemini-3-flash-preview",
     "gemini-flash-latest",
+    "gemini-3.1-pro-preview",
 )
 
-# Регулярное выражение для распознавания явных талонов/карт
+# Жесткий фильтр исключения: керосин (гас), авиатопливо (JET A-1, РТ, ТС-1), газ, сжиженный газ, мазут, масла
+EXCLUDED_FUEL_REGEX = re.compile(
+    r"(\bгас\b|\bгасу\b|гасов[еоиій]|газ\b|\bгазу\b|газов[еоиій]|скраплен|пропан|бутан|метан|"
+    r"авіаційн|реактивн|газотурбін|jet\s*a|джет|\bрт\b|\bтс-?1\b|мазут|олив[аи]|мастил|пічн[ео]\s+палив)",
+    re.IGNORECASE
+)
+
+# Обязательный фильтр целевого топлива: бензин или дизельное топливо в любых проявлениях
+MANDATORY_FUEL_REGEX = re.compile(
+    r"(дизельн|паливо\s+дизельн|пальне\s+дизельн|\bдп\b|дп-|бензин|\bа-?95\b|\bа-?92\b|\bа-?98\b|\bа-?80\b)",
+    re.IGNORECASE
+)
+
+# Фильтр для отсева явных талонов, топливных карт и скретч-карт
 COUPON_CARD_REGEX = re.compile(
     r"(талон|скретч|смарт-?карт|паливн[іи]х?\s+карт|бланк[іи]?в?-дозвол|заправк[аи]\s+на\s+азс|відпуск\s+з\s+азс)",
     re.IGNORECASE
 )
 BULK_KEYWORD_REGEX = re.compile(r"(налив|автоцистерн|бензовоз|вагон-?цистерн)", re.IGNORECASE)
+
+# Признаки ставки НДС 0% (Постановление КМУ №178 от 02.03.2022 и прямое указание ПДВ 0%)
+ZERO_VAT_REGEX = re.compile(
+    r"(постанов[аиуою]\s+кму\s*№?\s*178|від\s+02\.03\.2022\s*№?\s*178|пдв\s*0\s*%|0\s*%\s*пдв|"
+    r"нульов[оа]ю\s+ставк[оа]ю|за\s+ставкою\s+0\s*%)",
+    re.IGNORECASE
+)
 
 PROCUREMENT_METHODS = {
     "aboveThreshold": "Открытые торги с особенностями",
@@ -57,7 +78,8 @@ PROCUREMENT_METHODS = {
     "priceQuotation": "Запрос ценовых предложений",
     "negotiation": "Переговорная процедура",
     "negotiation.quick": "Переговорная процедура (ускоренная)",
-    "belowThreshold": "Упрощенная / допороговая закупка"
+    "belowThreshold": "Упрощенная закупка",
+    "reporting": "Отчет о заключенном договоре"
 }
 
 # 2. HTTP-сессия с пулом соединений
@@ -67,7 +89,7 @@ adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retries)
 http_session.mount("https://", adapter)
 http_session.mount("http://", adapter)
 
-# 3. База данных проверенных тендеров, курсоров и очереди гарантированного повтора
+# 3. База данных проверенных тендеров
 conn = sqlite3.connect("processed_tenders.db")
 cursor = conn.cursor()
 cursor.execute("CREATE TABLE IF NOT EXISTS tenders (id TEXT PRIMARY KEY)")
@@ -75,7 +97,11 @@ cursor.execute("CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, val
 cursor.execute("CREATE TABLE IF NOT EXISTS retry_queue (id TEXT PRIMARY KEY)")
 conn.commit()
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Удаляем из очереди авиационный тендер JET A-1 (UA-2026-10-23-004773-a)
+cursor.execute("DELETE FROM retry_queue WHERE id LIKE '%004773%'")
+conn.commit()
+
+client = genai.Client(vertexai=True, api_key=GEMINI_API_KEY)
 
 def is_already_processed(tender_id: str) -> bool:
     cursor.execute("SELECT 1 FROM tenders WHERE id = ?", (tender_id,))
@@ -103,7 +129,43 @@ def set_sync_val(key: str, val: str):
     cursor.execute("INSERT OR REPLACE INTO sync_state (key, val) VALUES (?, ?)", (key, val))
     conn.commit()
 
-# 4. Умная проверка явных талонов/карт с полной защитой многолотовых закупок
+# 4. Проверка номенклатуры: отсев авиатоплива/керосина/газа и проверка наличия ДТ/бензина
+def is_valid_diesel_or_gasoline_tender(tender: dict) -> tuple[bool, str]:
+    title_and_desc = f"{tender.get('title', '')} {tender.get('description', '')}"
+    items = tender.get("items", [])
+
+    # Проверяем каждую позицию номенклатуры
+    valid_fuel_items = []
+    for item in items:
+        cpv = str(item.get("classification", {}).get("id", ""))
+        item_desc = str(item.get("description", ""))
+
+        if cpv.startswith(EXCLUDED_CPV_PREFIXES):
+            continue
+        if not cpv.startswith(TARGET_CPV_PREFIXES):
+            continue
+        # Если в описании конкретной позиции указан гас, газ, JET A-1, авиатопливо — пропускаем позицию
+        if EXCLUDED_FUEL_REGEX.search(item_desc) and not MANDATORY_FUEL_REGEX.search(item_desc):
+            continue
+        valid_fuel_items.append(item_desc)
+
+    if not valid_fuel_items:
+        return False, "Нет позиций бензина или ДТ по целевым кодам ДК"
+
+    combined_items_text = " ".join(valid_fuel_items)
+    full_check_text = f"{title_and_desc} {combined_items_text}"
+
+    # Если заголовок тендера явно посвящен керосину (гас), газу или авиатопливу JET A-1 без бензина/ДТ
+    if EXCLUDED_FUEL_REGEX.search(full_check_text) and not MANDATORY_FUEL_REGEX.search(combined_items_text):
+        return False, "Отсеян по стоп-словам (гас / газ / авиатопливо JET A-1)"
+
+    # Обязательное наличие слов бензин / дизельне паливо / ДП
+    if not MANDATORY_FUEL_REGEX.search(full_check_text):
+        return False, "Не найдено упоминаний бензина или дизельного топлива"
+
+    return True, "OK"
+
+# 5. Умная проверка явных талонов/карт с полной защитой многолотовых закупок
 def is_strictly_coupons_or_cards(tender: dict) -> bool:
     full_header = f"{tender.get('title', '')} {tender.get('description', '')}"
     items_desc = " ".join(str(i.get("description", "")) for i in tender.get("items", []))
@@ -116,15 +178,14 @@ def is_strictly_coupons_or_cards(tender: dict) -> bool:
     if len(lots) > 1:
         active_lots = [l for l in lots if l.get("status", "active") == "active"]
         if active_lots:
-            all_lots_are_coupons = all(
+            return all(
                 bool(COUPON_CARD_REGEX.search(f"{l.get('title', '')} {l.get('description', '')}"))
                 for l in active_lots
             )
-            return all_lots_are_coupons
 
     return bool(COUPON_CARD_REGEX.search(full_header))
 
-# 5. Формирование прямой ссылки на закупку на площадке SmartTender.biz
+# 6. Формирование прямой ссылки на закупку на площадке SmartTender.biz
 def build_smarttender_url(tender_ua_id: str) -> str:
     gateway_url = f"https://smarttender.biz/government/details/{tender_ua_id}"
     try:
@@ -135,7 +196,7 @@ def build_smarttender_url(tender_ua_id: str) -> str:
         pass
     return gateway_url
 
-# 6. Форматирование даты и времени для Пункта 7 строго в формат: "ЧЧ:ММ, ДД-ММ-ГГГГ"
+# 7. Форматирование даты и времени: "ЧЧ:ММ, ДД-ММ-ГГГГ"
 def format_deadline_strict(iso_str: str) -> str:
     if not iso_str:
         return "Не указан"
@@ -145,7 +206,7 @@ def format_deadline_strict(iso_str: str) -> str:
         return f"{time_hm}, {day}-{month}-{year}"
     return str(iso_str)[:16].replace("T", " ")
 
-# 7. Гарантированное указание источника при ссылке на пункты: "(п. 4.1)" -> "(п. 4.1 Договора)"
+# 8. Гарантированное указание источника при ссылке на пункты: "(п. 4.1)" -> "(п. 4.1 Договора)"
 def enforce_clause_source(text: str, default_source: str = "Договора") -> str:
     if not text:
         return ""
@@ -161,17 +222,33 @@ def enforce_clause_source(text: str, default_source: str = "Договора") -
 
     return pattern.sub(replacer, text)
 
-# 8. Строгий математический расчет для Пункта 4 (ТОЛЬКО с НДС по формуле * 1.2)
-def calculate_budget_with_vat_strict(tender_data: dict) -> str:
-    budget_raw = float(tender_data.get("value", {}).get("amount", 0) or 0)
+# 9. Точный расчет бюджета с проверкой НДС (0% по Постановлению КМУ №178 или 20%)
+def calculate_budget_with_vat_verified(tender_data: dict, ai: dict, docs_text: str) -> str:
+    val = tender_data.get("value", {})
+    budget_raw = float(val.get("amount", 0) or 0)
+    prozorro_vat_included = bool(val.get("valueAddedTaxIncluded", False))
+
+    # Проверяем, применяется ли ставка НДС 0% (или без НДС) по договору/ТД
+    ai_vat_rate = ai.get("vat_rate_percent", 20)
+    is_zero_vat = (ai_vat_rate == 0) or bool(ZERO_VAT_REGEX.search(docs_text))
+
+    if is_zero_vat:
+        multiplier = 1.0
+        vat_label = "с НДС (0%)"
+    else:
+        # Если ставка 20%: умножаем на 1.2 только если в Prozorro бюджет указан БЕЗ НДС
+        multiplier = 1.0 if prozorro_vat_included else 1.2
+        vat_label = "с НДС"
+
     items = tender_data.get("items", [])
-    
     fuel_items = [
         i for i in items
         if str(i.get("classification", {}).get("id", "")).startswith(TARGET_CPV_PREFIXES)
+        and not str(i.get("classification", {}).get("id", "")).startswith(EXCLUDED_CPV_PREFIXES)
     ]
     target_items = fuel_items if fuel_items else items
 
+    # Если в закупке (или лоте) 1 позиция товара — считаем цену за 1 единицу с НДС
     if len(target_items) == 1:
         qty = float(target_items[0].get("quantity", 0) or 0)
         unit_raw = str(target_items[0].get("unit", {}).get("name", "ед.")).lower()
@@ -185,13 +262,13 @@ def calculate_budget_with_vat_strict(tender_data: dict) -> str:
             unit_label = unit_raw
 
         if qty > 0:
-            unit_price_with_vat = (budget_raw / qty) * 1.2
-            return f"{unit_price_with_vat:,.2f} грн/{unit_label} с НДС".replace(",", " ")
+            unit_price_with_vat = (budget_raw / qty) * multiplier
+            return f"{unit_price_with_vat:,.2f} грн/{unit_label} {vat_label}".replace(",", " ")
 
-    total_with_vat = budget_raw * 1.2
-    return f"{total_with_vat:,.2f} грн с НДС".replace(",", " ")
+    total_with_vat = budget_raw * multiplier
+    return f"{total_with_vat:,.2f} грн {vat_label}".replace(",", " ")
 
-# 9. Чтение файлов .docx и старых файлов .doc (Word 97-2003)
+# 10. Чтение файлов .docx и старых файлов .doc (Word 97-2003)
 def parse_docx_bytes(file_bytes: bytes, filename: str) -> str:
     try:
         doc = docx.Document(io.BytesIO(file_bytes))
@@ -228,7 +305,7 @@ def parse_old_doc_bytes(file_bytes: bytes, filename: str) -> str:
         pass
     return ""
 
-# 10. Выгрузка актуальных редакций вложений (полный объем для Tier 1)
+# 11. Выгрузка актуальных редакций вложений
 def extract_all_attachments(documents_json: list) -> tuple[str, list]:
     latest_docs = {}
     for d in documents_json:
@@ -249,7 +326,7 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
     def doc_priority(doc_item):
         t = doc_item.get("title", "").lower()
-        if any(k in t for k in ("догов", "контракт", "техніч", "документац", "додаток", "специфікац", "вимог")):
+        if any(k in t for k in ("догов", "контракт", "техніч", "документац", "додаток", "специфікац", "вимог", "оголош")):
             return 0
         return 1
 
@@ -302,10 +379,11 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
     return "\n\n".join(extracted_texts), pdf_parts
 
-# 11. Когнитивная экспертиза через Gemini (Tier 1)
+# 12. Когнитивная экспертиза через Gemini
 def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: list) -> dict:
     val = tender_data.get("value", {})
     budget_amount = val.get("amount", 0)
+    vat_included_flag = val.get("valueAddedTaxIncluded", False)
     guarantee_amount = tender_data.get("guarantee", {}).get("amount", 0)
     method_type = tender_data.get("procurementMethodType", "")
     method_readable = PROCUREMENT_METHODS.get(method_type, "Открытые торги")
@@ -320,7 +398,7 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
     Заголовок: {tender_data.get('title', '')}
     Описание: {tender_data.get('description', '')}
     Вид процедуры: {method_readable}
-    Бюджет закупки в системе: {budget_amount} UAH
+    Бюджет закупки в системе Prozorro: {budget_amount} UAH (флаг valueAddedTaxIncluded в системе: {vat_included_flag})
     Тендерное обеспечение в паспорте Prozorro: {guarantee_amount} UAH
     Лоты: {lots_json}
     Номенклатура и объемы (items): {items_json}
@@ -336,32 +414,32 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
             "Ты — ведущий тендерный юрист и аналитик оптового поставщика нефтепродуктов в Украине. "
             "Проанализируй паспорт закупки, поля milestones/items/lots и прикрепленный проект договора/ТД.\n"
             "КРИТЕРИЙ ОТБОРА (is_relevant = true):\n"
-            "1. Основной предмет закупки (или хотя бы одного отдельного лота в многолотовой закупке) — поставка дизельного топлива или бензинов НАЛИВОМ: "
+            "1. Ищем ТОЛЬКО закупки БЕНЗИНА или ДИЗЕЛЬНОГО ТОПЛИВА (бензин, дизельне паливо, паливо дизельне, ДП) НАЛИВОМ: "
             "АВТОМОБИЛЬНЫМ ТРАНСПОРТОМ (бензовозами/автоцистернами в резервуары заказчика или самовывозом) ИЛИ ЖЕЛЕЗНОДОРОЖНЫМ ТРАНСПОРТОМ (вагон-цистернами).\n"
-            "2. ВАЖНО: Если основной предмет закупки — талоны, топливные карты, скретч-карты, бланки-разрешения или требуется наличие сети АЗС для заправки машин "
-            "(даже если в договоре есть резервный пункт о наливе на случай остановки работы АЗС) — строго верни is_relevant = false!\n"
-            "3. В поле subject_and_procedure НЕ указывай '(Постановление КМУ №1178)' — пиши только предмет закупки и чистый вид процедуры.\n"
-            "4. ОБЯЗАТЕЛЬНОЕ ПРАВИЛО ССЫЛОК НА ПУНКТЫ: Везде, где ты указываешь привязку условия к определенному пункту, "
-            "СТРОГО ОБЯЗАТЕЛЬНО указывай не только номер пункта, но и точный источник (например: '(п. 4.1 Договора)', '(п. 3.2 Тендерной документации)', '(п. 2 Приложения 3 к ТД)'). "
-            "Категорически запрещено писать просто '(п. 4.1)' без слова 'Договора' или 'Тендерной документации'!\n"
-            "Все ответы формируй на русском языке (прямые цитаты из украинского договора приводи дословно в кавычках с указанием номера пункта и источника)."
+            "2. Если закупается авиационное топливо (JET A-1, РТ, ТС-1), керосин (гас, гасове паливо), газ, сжиженный газ (газ скраплений), мазут или масла — СТРОГО верни is_relevant = false!\n"
+            "3. Если основной предмет закупки — талоны, топливные карты, скретч-карты, бланки-разрешения или розничная заправка на АЗС — СТРОГО верни is_relevant = false!\n"
+            "4. ПРОВЕРКА НДС (vat_rate_percent): Внимательно проверь раздел 'Цена договора' в проекте договора! "
+            "Если заказчик (например, Нацгвардия, ВСУ, ГПСУ, ГСЧС) закупает топливо с НДС 0% (ПДВ 0%, в т.ч. согласно Постановлению КМУ №178 от 02.03.2022) или без НДС — укажи vat_rate_percent = 0. "
+            "Если применяется стандартная ставка НДС 20% — укажи vat_rate_percent = 20.\n"
+            "5. ОБЯЗАТЕЛЬНОЕ ПРАВИЛО ССЫЛОК НА ПУНКТЫ: Везде указывай номер пункта и точный источник (например: '(п. 4.1 Договора)', '(п. 4 Оголошення)', '(п. 3.2 Тендерной документации)').\n"
+            "Все ответы формируй на русском языке."
         ),
         response_mime_type="application/json",
         response_schema={
             "type": "OBJECT",
             "properties": {
                 "is_relevant": {"type": "BOOLEAN"},
-                "subject_and_procedure": {
-                    "type": "STRING",
-                    "description": "Пункт 2: Предмет закупки и вид торгов БЕЗ упоминания Постановления КМУ №1178"
+                "vat_rate_percent": {
+                    "type": "INTEGER",
+                    "description": "Ставка НДС по договору: 0 (если ПДВ 0% по Постановлению КМУ №178 или без ПДВ) или 20 (если стандартный НДС 20%)"
                 },
-                "fuel_grade_and_volume": {
+                "subject_grade_and_volume": {
                     "type": "STRING",
-                    "description": "Пункт 3: Марка топлива и точный объем с единицами измерения (тонны / кг / литры)"
+                    "description": "Пункт 1 (Предмет закупки и объем): Полное наименование товара, марка топлива (например: Дизельное топливо ДП (Л) – Евро-5) и точное количество с единицами измерения и ссылкой на пункт Договора/Оголошення"
                 },
                 "payment_terms": {
                     "type": "STRING",
-                    "description": "Пункт 5: Условия оплаты с обязательным указанием пункта и документа-источника, например: (п. 4.1 Договора)"
+                    "description": "Пункт 3: Условия оплаты с обязательным указанием пункта и документа-источника, например: (п. 4.1 Договора)"
                 },
                 "is_formula_pricing": {
                     "type": "BOOLEAN",
@@ -369,39 +447,39 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                 },
                 "formula_details": {
                     "type": "STRING",
-                    "description": "Пункт 6: Если цена формульная — точная математическая формула и описание всех коэффициентов с указанием пункта и источника (например: п. 3.4 Договора). Если фиксированная — напиши 'Цена фиксированная'"
+                    "description": "Пункт 4: Если цена формульная — точная математическая формула и описание всех коэффициентов с указанием пункта и источника. Если фиксированная — напиши 'Цена фиксированная'"
                 },
                 "delivery_mode_and_location": {
                     "type": "STRING",
-                    "description": "Пункт 8: Способ отгрузки, базис Инкотермс и точный адрес передачи товара с указанием пункта и источника (например: п. 5.2 Договора)"
+                    "description": "Пункт 6: Способ отгрузки, базис поставки и точный адрес передачи товара с указанием пункта и источника (например: п. 5.2 Договора)"
                 },
                 "delivery_and_contract_term": {
                     "type": "STRING",
-                    "description": "Пункт 9: Срок поставки партии, общий период поставки и срок действия договора с указанием пунктов и источника (например: п. 5.1, 10.1 Договора)"
+                    "description": "Пункт 7: Срок поставки партии, общий период поставки и срок действия договора с указанием пунктов и источника"
                 },
                 "bid_security_uah": {
                     "type": "STRING",
-                    "description": "Пункт 10: Обеспечение тендерного предложения — размер гарантии в сумме (грн) с указанием пункта Тендерной документации, или 'Не требуется'"
+                    "description": "Пункт 8: Обеспечение тендерного предложения — размер гарантии в сумме (грн) с указанием пункта ТД, или 'Не требуется'"
                 },
                 "contract_security_details": {
                     "type": "STRING",
-                    "description": "Пункт 11: Обеспечение выполнения договора — вид обеспечения и размер в % от суммы договора с указанием пункта Договора/ТД, или 'Не требуется'"
+                    "description": "Пункт 9: Обеспечение выполнения договора — вид обеспечения и размер в % от суммы договора с указанием пункта Договора/ТД, или 'Не требуется'"
                 },
                 "features_pitfalls_and_risks": {
                     "type": "STRING",
-                    "description": "Для кнопки 'Особенности тендера (Риски поставщика)' (Блок 1): Подводные камни, особенности приемки и риски убытков поставщика с номерами пунктов, источником (Договора / Тендерной документации) и прямыми цитатами"
+                    "description": "Для кнопки 'Особенности тендера (Риски поставщика)' (Блок 1): Подводные камни, особенности приемки и риски убытков поставщика с номерами пунктов, источником и прямыми цитатами"
                 },
                 "features_penalties": {
                     "type": "STRING",
-                    "description": "Для кнопки 'Особенности тендера (Риски поставщика)' (Блок 2): Ответственность поставщика (штрафы, пеня) — размер и за что вменяется, с номерами пунктов, источником (Договора) и прямыми цитатами"
+                    "description": "Для кнопки 'Особенности тендера (Риски поставщика)' (Блок 2): Ответственность поставщика (штрафы, пеня) с номерами пунктов, источником и прямыми цитатами"
                 },
                 "features_price_increase_rules": {
                     "type": "STRING",
-                    "description": "Для кнопки 'Особенности тендера (Риски поставщика)' (Блок 3): Условия повышения цены (документы, условия, ограничения) с номерами пунктов, источником (Договора / Тендерной документации) и прямыми цитатами"
+                    "description": "Для кнопки 'Особенности тендера (Риски поставщика)' (Блок 3): Условия повышения цены с номерами пунктов, источником и прямыми цитатами"
                 }
             },
             "required": [
-                "is_relevant", "subject_and_procedure", "fuel_grade_and_volume",
+                "is_relevant", "vat_rate_percent", "subject_grade_and_volume",
                 "payment_terms", "is_formula_pricing", "formula_details",
                 "delivery_mode_and_location", "delivery_and_contract_term",
                 "bid_security_uah", "contract_security_details",
@@ -427,14 +505,14 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                     primary_err = err
                 if "404" in err_str or "NOT_FOUND" in err_str:
                     break
-                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    time.sleep(3 * (attempt + 1))
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                    time.sleep(4 * (attempt + 1))
                     continue
                 break
-    raise (primary_err or Exception("Все модели Gemini временно перегружены"))
+    raise (primary_err or Exception("Все модели Gemini временно недоступны"))
 
-# 12. Сборка карточки из 12 пунктов и передача в Google Sheets CRM (17 колонок)
-def dispatch_to_crm(tender_data: dict, ai: dict):
+# 13. Сборка карточки в новом формате и передача в Google Sheets CRM
+def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str):
     tender_ua_id = tender_data.get("tenderID", "Не указан")
     entity = tender_data.get("procuringEntity", {})
     cust_name = entity.get("name", "Не указан")
@@ -444,20 +522,15 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     method_type = tender_data.get("procurementMethodType", "")
     procedure_clean = PROCUREMENT_METHODS.get(method_type, "Открытые торги")
 
-    subject_and_proc = re.sub(
-        r"\s*\(?Постановление КМУ №\s*1178\)?",
-        "",
-        ai.get("subject_and_procedure", ""),
-        flags=re.IGNORECASE
-    ).strip()
-
-    budget_display_str = calculate_budget_with_vat_strict(tender_data)
+    # Расчет бюджета с предварительной проверкой ставки НДС (0% или 20%)
+    budget_display_str = calculate_budget_with_vat_verified(tender_data, ai, docs_text)
 
     raw_end_date = tender_data.get("tenderPeriod", {}).get("endDate", "")
     deadline_formatted = format_deadline_strict(raw_end_date)
 
     tender_url = build_smarttender_url(tender_ua_id)
 
+    subject_vol_clean = enforce_clause_source(ai.get("subject_grade_and_volume", ""), "Договора")
     payment_terms_clean = enforce_clause_source(ai.get("payment_terms", ""), "Договора")
     delivery_loc_clean = enforce_clause_source(ai.get("delivery_mode_and_location", ""), "Договора")
     delivery_term_clean = enforce_clause_source(ai.get("delivery_and_contract_term", ""), "Договора")
@@ -478,21 +551,21 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     else:
         pricing_html = "Цена фиксированная"
 
+    # Новый формат уведомления для Админа, Руководителей и Зрителей
     card_html = (
-        f"<b>Тендер, ID:</b> <code>{html.escape(tender_ua_id)}</code>\n"
+        f"<b>Тендер:</b> <code>{html.escape(tender_ua_id)}</code> ({html.escape(procedure_clean)})\n"
         f"-----------------------------------------\n"
-        f"<b>1) {html.escape(customer_str)}</b>\n\n"
-        f"<b>2) Предмет закупки и вид торгов:</b> {html.escape(subject_and_proc)}\n\n"
-        f"<b>3) Марка топлива и объем:</b> {html.escape(ai['fuel_grade_and_volume'])}\n\n"
-        f"<b>4) Бюджет закупки:</b> {html.escape(budget_display_str)}\n\n"
-        f"<b>5) Условия оплаты:</b> {html.escape(payment_terms_clean)}\n\n"
-        f"<b>6) Ценообразование:</b> {pricing_html}\n\n"
-        f"<b>7) Срок подачи тендерного предложения:</b> до {html.escape(deadline_formatted)}\n\n"
-        f"<b>8) Условия поставки и адрес передачи товара:</b> {html.escape(delivery_loc_clean)}\n\n"
-        f"<b>9) Срок поставки и срок действия договора:</b> {html.escape(delivery_term_clean)}\n\n"
-        f"<b>10) Обеспечение тендерного предложения:</b> {html.escape(bid_sec_clean)}\n\n"
-        f"<b>11) Обеспечение договора:</b> {html.escape(contract_sec_clean)}\n\n"
-        f"<b>12) Ссылка на тендер:</b> <a href=\"{html.escape(tender_url)}\">{html.escape(tender_url)}</a>\n"
+        f"<b>{html.escape(customer_str)}</b>\n\n"
+        f"<b>1) Предмет закупки и объем:</b> {html.escape(subject_vol_clean)}\n\n"
+        f"<b>2) Бюджет закупки:</b> {html.escape(budget_display_str)}\n\n"
+        f"<b>3) Условия оплаты:</b> {html.escape(payment_terms_clean)}\n\n"
+        f"<b>4) Ценообразование:</b> {pricing_html}\n\n"
+        f"<b>5) Срок подачи тендерного предложения:</b> до {html.escape(deadline_formatted)}\n\n"
+        f"<b>6) Условия поставки и адрес передачи товара:</b> {html.escape(delivery_loc_clean)}\n\n"
+        f"<b>7) Срок поставки и срок действия договора:</b> {html.escape(delivery_term_clean)}\n\n"
+        f"<b>8) Обеспечение тендерного предложения:</b> {html.escape(bid_sec_clean)}\n\n"
+        f"<b>9) Обеспечение договора:</b> {html.escape(contract_sec_clean)}\n\n"
+        f"<b>10) Ссылка на тендер:</b> <a href=\"{html.escape(tender_url)}\">{html.escape(tender_url)}</a>\n"
         f"-----------------------------------------\n"
         f"<i>Ответьте (Reply) свободным текстом на это сообщение, чтобы ИИ внес вашу цену, статус или результат в таблицу.</i>"
     )
@@ -510,12 +583,13 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
         "source": "python_agent",
         "secret": SECRET_BRIDGE_KEY,
         "tender": {
+            "prozorroInternalId": tender_data.get("id", tender_ua_id),
             "tenderID": tender_ua_id,
             "customerName": cust_name,
             "customerEdrpou": cust_edrpou,
             "procedureType": procedure_clean,
             "budgetDisplay": budget_display_str,
-            "fuelSummary": ai["fuel_grade_and_volume"],
+            "fuelSummary": subject_vol_clean,
             "deliveryAndTerms": f"{delivery_loc_clean} | Сроки: {delivery_term_clean}",
             "paymentAndGuarantees": (
                 f"Оплата: {payment_terms_clean} | "
@@ -534,7 +608,114 @@ def dispatch_to_crm(tender_data: dict, ai: dict):
     resp = http_session.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
     print(f" -> Ответ Google Таблицы: {resp.text[:120]}")
 
-# 13. Загрузка карточки тендера с защитой и автоповтором при коде 429
+# 14. Проверка результатов торгов (победитель / акцепт / самая низкая цена в ЗЦП)
+# ТОЛЬКО для тендеров, где была нажата кнопка "Принимаем участие"
+def check_results_for_participating_tenders():
+    try:
+        req_payload = {
+            "source": "python_agent",
+            "secret": SECRET_BRIDGE_KEY,
+            "action": "get_tracked_tenders"
+        }
+        r = http_session.post(GOOGLE_WEB_APP_URL, json=req_payload, timeout=20)
+        if r.status_code != 200:
+            return
+        resp_data = r.json()
+        tracked_list = resp_data.get("trackedTenders", [])
+        if not tracked_list:
+            return
+
+        print(f"=== Проверка результатов торгов по тендерам «Принимаем участие» ({len(tracked_list)} шт.) ===")
+        for item in tracked_list:
+            tender_ua_id = item.get("tenderID", "")
+            lookup_id = item.get("prozorroInternalId") or tender_ua_id
+            already_notified_stage = item.get("notifiedStage", "")
+
+            t_data = fetch_tender_detail(lookup_id)
+            if not t_data:
+                continue
+
+            awards = t_data.get("awards", [])
+            bids = t_data.get("bids", [])
+            method_type = t_data.get("procurementMethodType", "")
+
+            event_stage = ""
+            event_title = ""
+            winner_name = ""
+            winner_edrpou = ""
+            price_str = ""
+
+            # 1. Проверяем наличие официального победителя / акцепта (award.status == "active")
+            active_awards = [a for a in awards if a.get("status") == "active"]
+            pending_awards = [a for a in awards if a.get("status") == "pending"]
+
+            if active_awards:
+                aw = active_awards[-1]
+                supp = (aw.get("suppliers") or [{}])[0]
+                winner_name = supp.get("name", "Не указано")
+                winner_edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
+                val = aw.get("value", {})
+                amt = float(val.get("amount", 0) or 0)
+                vat_inc = val.get("valueAddedTaxIncluded", False)
+                price_str = f"{amt:,.2f} грн ({'с НДС' if vat_inc else 'без НДС'})".replace(",", " ")
+                event_stage = f"active_award_{aw.get('id', '')}"
+                event_title = "АКЦЕПТ / ПРИЗНАН ПОБЕДИТЕЛЬ ТЕНДЕРА"
+
+            # 2. Если акцепта еще нет, проверяем кандидата с самой дешевой ценой на квалификации (award.status == "pending")
+            elif pending_awards:
+                aw = pending_awards[-1]
+                supp = (aw.get("suppliers") or [{}])[0]
+                winner_name = supp.get("name", "Не указано")
+                winner_edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
+                val = aw.get("value", {})
+                amt = float(val.get("amount", 0) or 0)
+                vat_inc = val.get("valueAddedTaxIncluded", False)
+                price_str = f"{amt:,.2f} грн ({'с НДС' if vat_inc else 'без НДС'})".replace(",", " ")
+                event_stage = f"pending_award_{aw.get('id', '')}"
+                if method_type == "priceQuotation":
+                    event_title = "ЗАПРОС ЦЕНОВЫХ ПРЕДЛОЖЕНИЙ: НАИМЕНЬШАЯ ЦЕНА (НА РАССМОТРЕНИИ)"
+                else:
+                    event_title = "ОПРЕДЕЛЕН ЛИДЕР С НАИМЕНЬШЕЙ ЦЕНОЙ (КВАЛИФИКАЦИЯ)"
+
+            # 3. Дополнительно проверяем раскрытые предложения (bids), если awards еще не сформирован
+            elif bids:
+                valid_bids = [
+                    b for b in bids
+                    if b.get("status", "active") in ("active", "pending")
+                    and b.get("value", {}).get("amount") is not None
+                    and b.get("tenderers")
+                ]
+                if valid_bids:
+                    valid_bids.sort(key=lambda x: float(x["value"]["amount"]))
+                    best_bid = valid_bids[0]
+                    supp = best_bid["tenderers"][0]
+                    winner_name = supp.get("name", "Не указано")
+                    winner_edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
+                    val = best_bid.get("value", {})
+                    amt = float(val.get("amount", 0) or 0)
+                    vat_inc = val.get("valueAddedTaxIncluded", False)
+                    price_str = f"{amt:,.2f} грн ({'с НДС' if vat_inc else 'без НДС'})".replace(",", " ")
+                    event_stage = f"lowest_bid_{best_bid.get('id', '')}"
+                    event_title = "РАСКРЫТЫ ПРЕДЛОЖЕНИЯ: УЧАСТНИК С САМОЙ НИЗКОЙ ЦЕНОЙ"
+
+            if event_stage and event_stage != already_notified_stage:
+                notify_payload = {
+                    "source": "python_agent",
+                    "secret": SECRET_BRIDGE_KEY,
+                    "action": "notify_tender_result",
+                    "tenderID": tender_ua_id,
+                    "eventStage": event_stage,
+                    "eventTitle": event_title,
+                    "winnerName": winner_name,
+                    "winnerEdrpou": winner_edrpou,
+                    "winningPrice": price_str
+                }
+                nr = http_session.post(GOOGLE_WEB_APP_URL, json=notify_payload, timeout=20)
+                print(f" -> Отправлено уведомление о результатах {tender_ua_id} ({winner_name}): {nr.text[:100]}")
+    except Exception as e:
+        print(f"Ошибка при проверке результатов активных тендеров: {e}")
+
+# 15. Загрузка карточки тендера с защитой и автоповтором при коде 429
 def fetch_tender_detail(t_id: str) -> dict:
     for attempt in range(4):
         try:
@@ -548,7 +729,7 @@ def fetch_tender_detail(t_id: str) -> dict:
             pass
     return {}
 
-# 14. Оценка активных тендеров (на максимальной скорости коммерческого тарифа Tier 1)
+# 16. Оценка активных тендеров
 def evaluate_active_tenders(active_ids: list, gemini_budget_left: int) -> tuple[int, int, int, int]:
     matched_budget = 0
     matched_fuel_cpv = 0
@@ -577,12 +758,9 @@ def evaluate_active_tenders(active_ids: list, gemini_budget_left: int) -> tuple[
 
             matched_budget += 1
 
-            items = tender.get("items", [])
-            has_fuel_cpv = any(
-                str(i.get("classification", {}).get("id", "")).startswith(TARGET_CPV_PREFIXES)
-                for i in items
-            )
-            if not has_fuel_cpv:
+            # Проверяем, что это именно бензин или дизельное топливо (без гаса, газа и JET A-1)
+            is_valid_fuel, _ = is_valid_diesel_or_gasoline_tender(tender)
+            if not is_valid_fuel:
                 mark_as_processed(tid)
                 continue
 
@@ -593,7 +771,7 @@ def evaluate_active_tenders(active_ids: list, gemini_budget_left: int) -> tuple[
         t_id = tender["id"]
         tender_ua_id = tender.get("tenderID", t_id)
         amount = float(tender.get("value", {}).get("amount", 0) or 0)
-        print(f"Топливный тендер >= 2.4 млн: {tender_ua_id} | {amount:,.2f} грн | {tender.get('title', '')[:70]}")
+        print(f"Целевой тендер (Бензин/ДТ >= 2.4 млн): {tender_ua_id} | {amount:,.2f} грн | {tender.get('title', '')[:70]}")
 
         if is_strictly_coupons_or_cards(tender):
             print(f" -> Мгновенно отсеян (явные талоны/топливные карты без налива): {tender_ua_id}")
@@ -608,18 +786,18 @@ def evaluate_active_tenders(active_ids: list, gemini_budget_left: int) -> tuple[
 
         try:
             if gemini_used > 0:
-                time.sleep(0.5)  # Минимальный интервал для Tier 1 (1000 RPM / 4M TPM)
-            print(f" -> Скачивание документации и экспертиза Gemini (Tier 1) для {tender_ua_id}...")
+                time.sleep(2)
+            print(f" -> Скачивание документации и экспертиза Gemini для {tender_ua_id}...")
             docs_text, pdf_parts = extract_all_attachments(tender.get("documents", []))
             ai_verdict = analyze_tender_with_gemini(tender, docs_text, pdf_parts)
             gemini_used += 1
 
             if ai_verdict.get("is_relevant"):
                 print(f" -> ПОДТВЕРЖДЕН НАЛИВ! Отправка в Google Sheets и Telegram: {tender_ua_id}")
-                dispatch_to_crm(tender, ai_verdict)
+                dispatch_to_crm(tender, ai_verdict, docs_text)
                 sent_to_crm += 1
             else:
-                print(f" -> Отклонен ИИ после чтения ТД (талоны/карты/АЗС): {tender_ua_id}")
+                print(f" -> Отклонен ИИ после чтения ТД (талоны/карты/АЗС/не ДТ и не бензин): {tender_ua_id}")
 
             mark_as_processed(t_id)
             mark_as_processed(tender_ua_id)
@@ -630,7 +808,7 @@ def evaluate_active_tenders(active_ids: list, gemini_budget_left: int) -> tuple[
 
     return matched_budget, matched_fuel_cpv, sent_to_crm, gemini_used
 
-# 15. Главный цикл мониторинга
+# 17. Главный цикл мониторинга
 def run_monitoring():
     total_scanned = 0
     total_active = 0
@@ -639,6 +817,7 @@ def run_monitoring():
     total_sent = 0
     gemini_left = MAX_GEMINI_ANALYSES_PER_RUN
 
+    # Шаг 0: Проверка очереди retry_queue
     retry_ids = get_retry_queue_ids()
     if retry_ids:
         print(f"=== Проверка отложенных тендеров из очереди retry_queue ({len(retry_ids)} шт.) ===")
@@ -649,6 +828,7 @@ def run_monitoring():
         total_fuel += rf
         total_sent += rs
 
+    # Шаг 1: Проверка свежих изменений ленты Prozorro
     last_top_ts = get_sync_val("last_top_ts")
     new_top_ts = ""
     next_url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status"
@@ -696,12 +876,16 @@ def run_monitoring():
     total_fuel += f1
     total_sent += s1
 
+    # Шаг 2: Проверка победителей / акцептов по тем тендерам, где нажата кнопка "Принимаем участие"
+    check_results_for_participating_tenders()
+
     remaining_in_queue = len(get_retry_queue_ids())
     print("=========================================")
     print("ИТОГИ ЦИКЛА МОНИТОРИНГА:")
     print(f"- Всего просмотрено записей в ленте: {total_scanned}")
     print(f"- Из них проверено активных карточек: {total_active}")
     print(f"- Активных тендеров с бюджетом >= 2.4 млн грн: {total_budget}")
+    print(f"- Из них целевых (бензин / ДТ): {total_fuel}")
     print(f"- Подтверждено наливом и отправлено в Telegram: {total_sent}")
     print(f"- Осталось в очереди retry_queue на следующий цикл: {remaining_in_queue}")
     print("=========================================")
