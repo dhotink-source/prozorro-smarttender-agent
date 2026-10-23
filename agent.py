@@ -36,7 +36,7 @@ EXCLUDED_CPV_PREFIXES = ("09131", "09133", "09135")
 
 MAX_GEMINI_ANALYSES_PER_RUN = 15
 
-# Актуальная линейка моделей Gemini 3 для новых проектов в Vertex AI
+# Актуальная линейка моделей Gemini 3 для Vertex AI
 GEMINI_MODELS_FALLBACK = (
     "gemini-3-flash-preview",
     "gemini-3.0-flash",
@@ -117,7 +117,6 @@ if GEMINI_API_KEY.startswith("{"):
             creds_info,
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
-    # В Vertex AI модели Gemini 3.x размещены на глобальном шлюзе location="global"
     for loc in ("global", "us-central1"):
         vertex_clients.append((
             loc,
@@ -156,6 +155,11 @@ def get_sync_val(key: str) -> str:
 def set_sync_val(key: str, val: str):
     cursor.execute("INSERT OR REPLACE INTO sync_state (key, val) VALUES (?, ?)", (key, val))
     conn.commit()
+
+def get_total_processed_count() -> int:
+    cursor.execute("SELECT COUNT(*) FROM tenders")
+    row = cursor.fetchone()
+    return int(row[0]) if row else 0
 
 # 4. Проверка номенклатуры: отсев авиатоплива/керосина/газа и проверка наличия ДТ/бензина
 def is_valid_diesel_or_gasoline_tender(tender: dict) -> tuple[bool, str]:
@@ -246,8 +250,8 @@ def enforce_clause_source(text: str, default_source: str = "Договора") -
 
     return pattern.sub(replacer, text)
 
-# 9. Точный расчет бюджета с проверкой НДС (0% по Постановлению КМУ №178 или 20%)
-def calculate_budget_with_vat_verified(tender_data: dict, ai: dict, docs_text: str) -> str:
+# 9. Извлечение параметров НДС, количества позиций и расчет бюджета/цены за единицу
+def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str) -> dict:
     val = tender_data.get("value", {})
     budget_raw = float(val.get("amount", 0) or 0)
     prozorro_vat_included = bool(val.get("valueAddedTaxIncluded", False))
@@ -269,9 +273,12 @@ def calculate_budget_with_vat_verified(tender_data: dict, ai: dict, docs_text: s
         and not str(i.get("classification", {}).get("id", "")).startswith(EXCLUDED_CPV_PREFIXES)
     ]
     target_items = fuel_items if fuel_items else items
+    items_count = len(target_items)
+    single_qty = 0.0
+    unit_label = "ед."
 
-    if len(target_items) == 1:
-        qty = float(target_items[0].get("quantity", 0) or 0)
+    if items_count == 1:
+        single_qty = float(target_items[0].get("quantity", 0) or 0)
         unit_raw = str(target_items[0].get("unit", {}).get("name", "ед.")).lower()
         if "літр" in unit_raw or "литр" in unit_raw or unit_raw == "л":
             unit_label = "литр"
@@ -282,11 +289,47 @@ def calculate_budget_with_vat_verified(tender_data: dict, ai: dict, docs_text: s
         else:
             unit_label = unit_raw
 
-        if qty > 0:
-            unit_price_with_vat = (budget_raw / qty) * multiplier
-            return f"{unit_price_with_vat:,.2f} грн/{unit_label} {vat_label}".replace(",", " ")
+        if single_qty > 0:
+            unit_price_with_vat = (budget_raw / single_qty) * multiplier
+            budget_str = f"{unit_price_with_vat:,.2f} грн/{unit_label} {vat_label}".replace(",", " ")
+            return {
+                "budgetDisplay": budget_str,
+                "isZeroVat": is_zero_vat,
+                "itemsCount": 1,
+                "singleItemQty": single_qty,
+                "unitLabel": unit_label
+            }
 
     total_with_vat = budget_raw * multiplier
+    budget_str = f"{total_with_vat:,.2f} грн {vat_label}".replace(",", " ")
+    return {
+        "budgetDisplay": budget_str,
+        "isZeroVat": is_zero_vat,
+        "itemsCount": items_count,
+        "singleItemQty": 0.0,
+        "unitLabel": unit_label
+    }
+
+# Форматирование цены конкретного участника (за единицу с НДС при 1 позиции, либо общая сумма с НДС)
+def format_participant_price_with_vat(
+    raw_amount: float,
+    bid_vat_included: bool,
+    is_zero_vat: bool,
+    items_count: int,
+    single_qty: float,
+    unit_label: str
+) -> str:
+    if is_zero_vat:
+        multiplier = 1.0
+        vat_label = "с НДС (0%)"
+    else:
+        multiplier = 1.0 if bid_vat_included else 1.2
+        vat_label = "с НДС"
+
+    total_with_vat = float(raw_amount or 0) * multiplier
+    if items_count == 1 and single_qty > 0:
+        unit_price = total_with_vat / single_qty
+        return f"{unit_price:,.2f} грн/{unit_label} {vat_label}".replace(",", " ")
     return f"{total_with_vat:,.2f} грн {vat_label}".replace(",", " ")
 
 # 10. Чтение файлов .docx и старых файлов .doc (Word 97-2003)
@@ -546,7 +589,8 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str):
     method_type = tender_data.get("procurementMethodType", "")
     procedure_clean = PROCUREMENT_METHODS.get(method_type, "Открытые торги")
 
-    budget_display_str = calculate_budget_with_vat_verified(tender_data, ai, docs_text)
+    pricing_meta = extract_pricing_meta_and_budget(tender_data, ai, docs_text)
+    budget_display_str = pricing_meta["budgetDisplay"]
 
     raw_end_date = tender_data.get("tenderPeriod", {}).get("endDate", "")
     deadline_formatted = format_deadline_strict(raw_end_date)
@@ -611,6 +655,10 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str):
             "customerEdrpou": cust_edrpou,
             "procedureType": procedure_clean,
             "budgetDisplay": budget_display_str,
+            "isZeroVat": pricing_meta["isZeroVat"],
+            "itemsCount": pricing_meta["itemsCount"],
+            "singleItemQty": pricing_meta["singleItemQty"],
+            "unitLabel": pricing_meta["unitLabel"],
             "fuelSummary": subject_vol_clean,
             "deliveryAndTerms": f"{delivery_loc_clean} | Сроки: {delivery_term_clean}",
             "paymentAndGuarantees": (
@@ -630,7 +678,180 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str):
     resp = http_session.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
     print(f" -> Ответ Google Таблицы: {resp.text[:120]}")
 
-# 14. Проверка результатов торгов по тендерам «Принимаем участие»
+# 14. Построение полного списка всех участников с ценами за единицу (или общей суммой) с НДС
+def build_participants_ranking_from_prozorro(
+    t_data: dict,
+    is_zero_vat: bool,
+    items_count: int,
+    single_qty: float,
+    unit_label: str
+) -> dict:
+    awards = t_data.get("awards", [])
+    bids = t_data.get("bids", [])
+    method_type = t_data.get("procurementMethodType", "")
+
+    # Если метаданные количества еще не были сохранены для старых строк, определяем из паспорта
+    if items_count <= 0:
+        items = t_data.get("items", [])
+        fuel_items = [
+            i for i in items
+            if str(i.get("classification", {}).get("id", "")).startswith(TARGET_CPV_PREFIXES)
+            and not str(i.get("classification", {}).get("id", "")).startswith(EXCLUDED_CPV_PREFIXES)
+        ]
+        target_items = fuel_items if fuel_items else items
+        items_count = len(target_items)
+        if items_count == 1:
+            single_qty = float(target_items[0].get("quantity", 0) or 0)
+            unit_raw = str(target_items[0].get("unit", {}).get("name", "ед.")).lower()
+            if "літр" in unit_raw or "литр" in unit_raw or unit_raw == "л":
+                unit_label = "литр"
+            elif "тон" in unit_raw or unit_raw == "т":
+                unit_label = "тонну"
+            elif "кілогр" in unit_raw or "килогр" in unit_raw or unit_raw == "кг":
+                unit_label = "кг"
+            else:
+                unit_label = unit_raw
+
+    # Карта статусов из awards по bid_id и по ЕГРПОУ участника
+    award_by_bid = {}
+    award_by_edrpou = {}
+    for aw in awards:
+        aw_status = aw.get("status", "")
+        bid_id = aw.get("bid_id", "")
+        supp = (aw.get("suppliers") or [{}])[0]
+        edrpou = str(supp.get("identifier", {}).get("id", ""))
+        label = "Участник"
+        if aw_status == "active":
+            label = "ПОБЕДИТЕЛЬ (Акцепт)"
+        elif aw_status == "pending":
+            label = "НА РАССМОТРЕНИИ (Квалификация)"
+        elif aw_status == "unsuccessful":
+            label = "Отклонено"
+        elif aw_status == "cancelled":
+            label = "Решение отменено"
+
+        if bid_id:
+            award_by_bid[bid_id] = label
+        if edrpou:
+            award_by_edrpou[edrpou] = label
+
+    participants = []
+    if bids:
+        for b in bids:
+            if b.get("status", "active") not in ("active", "pending"):
+                continue
+            tenderers = b.get("tenderers") or []
+            if not tenderers:
+                continue
+            supp = tenderers[0]
+            name = supp.get("name", "Не указано")
+            edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
+
+            val = b.get("value")
+            if not val and b.get("lotValues"):
+                val = b["lotValues"][0].get("value", {})
+            if not val or val.get("amount") is None:
+                continue
+
+            raw_amt = float(val.get("amount", 0) or 0)
+            vat_inc = bool(val.get("valueAddedTaxIncluded", False))
+            bid_id = b.get("id", "")
+            status_label = award_by_bid.get(bid_id) or award_by_edrpou.get(edrpou) or "Участник"
+
+            price_formatted = format_participant_price_with_vat(
+                raw_amt, vat_inc, is_zero_vat, items_count, single_qty, unit_label
+            )
+            participants.append({
+                "rawAmount": raw_amt,
+                "name": name,
+                "edrpou": edrpou,
+                "priceFormatted": price_formatted,
+                "statusLabel": status_label
+            })
+
+    # Если массив bids еще закрыт или пуст, но есть awards (например, в ЗЦП или после квалификации)
+    if not participants and awards:
+        seen_edrpou = set()
+        for aw in awards:
+            aw_status = aw.get("status", "")
+            if aw_status == "cancelled":
+                continue
+            supp = (aw.get("suppliers") or [{}])[0]
+            name = supp.get("name", "Не указано")
+            edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
+            val = aw.get("value", {})
+            if val.get("amount") is None:
+                continue
+            raw_amt = float(val.get("amount", 0) or 0)
+            vat_inc = bool(val.get("valueAddedTaxIncluded", False))
+
+            if aw_status == "active":
+                status_label = "ПОБЕДИТЕЛЬ (Акцепт)"
+            elif aw_status == "pending":
+                status_label = "НА РАССМОТРЕНИИ (Квалификация)"
+            elif aw_status == "unsuccessful":
+                status_label = "Отклонено"
+            else:
+                status_label = "Участник"
+
+            key = f"{edrpou}_{raw_amt}"
+            if key in seen_edrpou:
+                continue
+            seen_edrpou.add(key)
+
+            price_formatted = format_participant_price_with_vat(
+                raw_amt, vat_inc, is_zero_vat, items_count, single_qty, unit_label
+            )
+            participants.append({
+                "rawAmount": raw_amt,
+                "name": name,
+                "edrpou": edrpou,
+                "priceFormatted": price_formatted,
+                "statusLabel": status_label
+            })
+
+    participants.sort(key=lambda x: x["rawAmount"])
+
+    # Определяем стадию события
+    active_awards = [a for a in awards if a.get("status") == "active"]
+    pending_awards = [a for a in awards if a.get("status") == "pending"]
+
+    event_stage = ""
+    event_title = ""
+    winner_summary = ""
+
+    if active_awards:
+        aw = active_awards[-1]
+        event_stage = f"active_award_{aw.get('id', '')}"
+        event_title = "АКЦЕПТ / ПРИЗНАН ПОБЕДИТЕЛЬ ТЕНДЕРА"
+    elif pending_awards:
+        aw = pending_awards[-1]
+        event_stage = f"pending_award_{aw.get('id', '')}"
+        if method_type == "priceQuotation":
+            event_title = "ЗАПРОС ЦЕНОВЫХ ПРЕДЛОЖЕНИЙ: РАСКРЫТЫ ЦЕНЫ (НА РАССМОТРЕНИИ)"
+        else:
+            event_title = "КВАЛИФИКАЦИЯ: ОПРЕДЕЛЕН ЛИДЕР С НАИМЕНЬШЕЙ ЦЕНОЙ"
+    elif participants:
+        event_stage = f"lowest_bid_{len(participants)}_{participants[0]['rawAmount']}"
+        event_title = "РАСКРЫТЫ ПРЕДЛОЖЕНИЯ УЧАСТНИКОВ"
+
+    if participants:
+        top_p = participants[0]
+        for p in participants:
+            if "ПОБЕДИТЕЛЬ" in p["statusLabel"]:
+                top_p = p
+                break
+        winner_summary = f"{top_p['name']} ({top_p['priceFormatted']})"
+
+    return {
+        "eventStage": event_stage,
+        "eventTitle": event_title,
+        "winnerSummary": winner_summary,
+        "participants": participants,
+        "itemsCount": items_count
+    }
+
+# Проверка результатов торгов по тендерам «Принимаем участие»
 def check_results_for_participating_tenders():
     try:
         req_payload = {
@@ -651,89 +872,65 @@ def check_results_for_participating_tenders():
             tender_ua_id = item.get("tenderID", "")
             lookup_id = item.get("prozorroInternalId") or tender_ua_id
             already_notified_stage = item.get("notifiedStage", "")
+            is_zero_vat = bool(item.get("isZeroVat", False))
+            items_count = int(item.get("itemsCount", 0) or 0)
+            single_qty = float(item.get("singleItemQty", 0) or 0)
+            unit_label = str(item.get("unitLabel", "литр") or "литр")
 
             t_data = fetch_tender_detail(lookup_id)
             if not t_data:
                 continue
 
-            awards = t_data.get("awards", [])
-            bids = t_data.get("bids", [])
-            method_type = t_data.get("procurementMethodType", "")
+            ranking_info = build_participants_ranking_from_prozorro(
+                t_data, is_zero_vat, items_count, single_qty, unit_label
+            )
+            event_stage = ranking_info["eventStage"]
+            participants = ranking_info["participants"]
 
-            event_stage = ""
-            event_title = ""
-            winner_name = ""
-            winner_edrpou = ""
-            price_str = ""
-
-            active_awards = [a for a in awards if a.get("status") == "active"]
-            pending_awards = [a for a in awards if a.get("status") == "pending"]
-
-            if active_awards:
-                aw = active_awards[-1]
-                supp = (aw.get("suppliers") or [{}])[0]
-                winner_name = supp.get("name", "Не указано")
-                winner_edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
-                val = aw.get("value", {})
-                amt = float(val.get("amount", 0) or 0)
-                vat_inc = val.get("valueAddedTaxIncluded", False)
-                price_str = f"{amt:,.2f} грн ({'с НДС' if vat_inc else 'без НДС'})".replace(",", " ")
-                event_stage = f"active_award_{aw.get('id', '')}"
-                event_title = "АКЦЕПТ / ПРИЗНАН ПОБЕДИТЕЛЬ ТЕНДЕРА"
-
-            elif pending_awards:
-                aw = pending_awards[-1]
-                supp = (aw.get("suppliers") or [{}])[0]
-                winner_name = supp.get("name", "Не указано")
-                winner_edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
-                val = aw.get("value", {})
-                amt = float(val.get("amount", 0) or 0)
-                vat_inc = val.get("valueAddedTaxIncluded", False)
-                price_str = f"{amt:,.2f} грн ({'с НДС' if vat_inc else 'без НДС'})".replace(",", " ")
-                event_stage = f"pending_award_{aw.get('id', '')}"
-                if method_type == "priceQuotation":
-                    event_title = "ЗАПРОС ЦЕНОВЫХ ПРЕДЛОЖЕНИЙ: НАИМЕНЬШАЯ ЦЕНА (НА РАССМОТРЕНИИ)"
-                else:
-                    event_title = "ОПРЕДЕЛЕН ЛИДЕР С НАИМЕНЬШЕЙ ЦЕНОЙ (КВАЛИФИКАЦИЯ)"
-
-            elif bids:
-                valid_bids = [
-                    b for b in bids
-                    if b.get("status", "active") in ("active", "pending")
-                    and b.get("value", {}).get("amount") is not None
-                    and b.get("tenderers")
-                ]
-                if valid_bids:
-                    valid_bids.sort(key=lambda x: float(x["value"]["amount"]))
-                    best_bid = valid_bids[0]
-                    supp = best_bid["tenderers"][0]
-                    winner_name = supp.get("name", "Не указано")
-                    winner_edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
-                    val = best_bid.get("value", {})
-                    amt = float(val.get("amount", 0) or 0)
-                    vat_inc = val.get("valueAddedTaxIncluded", False)
-                    price_str = f"{amt:,.2f} грн ({'с НДС' if vat_inc else 'без НДС'})".replace(",", " ")
-                    event_stage = f"lowest_bid_{best_bid.get('id', '')}"
-                    event_title = "РАСКРЫТЫ ПРЕДЛОЖЕНИЯ: УЧАСТНИК С САМОЙ НИЗКОЙ ЦЕНОЙ"
-
-            if event_stage and event_stage != already_notified_stage:
+            if event_stage and participants and event_stage != already_notified_stage:
                 notify_payload = {
                     "source": "python_agent",
                     "secret": SECRET_BRIDGE_KEY,
                     "action": "notify_tender_result",
                     "tenderID": tender_ua_id,
                     "eventStage": event_stage,
-                    "eventTitle": event_title,
-                    "winnerName": winner_name,
-                    "winnerEdrpou": winner_edrpou,
-                    "winningPrice": price_str
+                    "eventTitle": ranking_info["eventTitle"],
+                    "winnerSummary": ranking_info["winnerSummary"],
+                    "itemsCount": ranking_info["itemsCount"],
+                    "participants": participants
                 }
                 nr = http_session.post(GOOGLE_WEB_APP_URL, json=notify_payload, timeout=20)
-                print(f" -> Отправлено уведомление о результатах {tender_ua_id} ({winner_name}): {nr.text[:100]}")
+                print(f" -> Отправлено уведомление о результатах {tender_ua_id}: {nr.text[:100]}")
     except Exception as e:
         print(f"Ошибка при проверке результатов активных тендеров: {e}")
 
-# 15. Загрузка карточки тендера с защитой и автоповтором при коде 429
+# 15. Синхронизация счетчиков проверенных закупок для кнопки «Статистика»
+def sync_stats_to_crm(gemini_used_this_run: int):
+    try:
+        start_date = get_sync_val("monitoring_start_date")
+        if not start_date:
+            start_date = "20.10.2026"
+            set_sync_val("monitoring_start_date", start_date)
+
+        total_taken_db = get_total_processed_count()
+        prev_ai_str = get_sync_val("stats_ai_analyzed")
+        prev_ai = int(prev_ai_str) if prev_ai_str.isdigit() else 28
+        total_ai_analyzed = prev_ai + gemini_used_this_run
+        set_sync_val("stats_ai_analyzed", str(total_ai_analyzed))
+
+        stats_payload = {
+            "source": "python_agent",
+            "secret": SECRET_BRIDGE_KEY,
+            "action": "sync_stats",
+            "monitoringStartDate": start_date,
+            "totalTaken": total_taken_db,
+            "totalAiAnalyzed": total_ai_analyzed
+        }
+        http_session.post(GOOGLE_WEB_APP_URL, json=stats_payload, timeout=15)
+    except Exception as e:
+        print(f"Ошибка синхронизации статистики: {e}")
+
+# 16. Загрузка карточки тендера с защитой и автоповтором при коде 429
 def fetch_tender_detail(t_id: str) -> dict:
     for attempt in range(4):
         try:
@@ -747,7 +944,7 @@ def fetch_tender_detail(t_id: str) -> dict:
             pass
     return {}
 
-# 16. Оценка активных тендеров
+# 17. Оценка активных тендеров
 def evaluate_active_tenders(active_ids: list, gemini_budget_left: int) -> tuple[int, int, int, int]:
     matched_budget = 0
     matched_fuel_cpv = 0
@@ -825,13 +1022,14 @@ def evaluate_active_tenders(active_ids: list, gemini_budget_left: int) -> tuple[
 
     return matched_budget, matched_fuel_cpv, sent_to_crm, gemini_used
 
-# 17. Главный цикл мониторинга
+# 18. Главный цикл мониторинга
 def run_monitoring():
     total_scanned = 0
     total_active = 0
     total_budget = 0
     total_fuel = 0
     total_sent = 0
+    total_gemini_used = 0
     gemini_left = MAX_GEMINI_ANALYSES_PER_RUN
 
     retry_ids = get_retry_queue_ids()
@@ -839,6 +1037,7 @@ def run_monitoring():
         print(f"=== Проверка отложенных тендеров из очереди retry_queue ({len(retry_ids)} шт.) ===")
         rb, rf, rs, g_used = evaluate_active_tenders(retry_ids, gemini_left)
         gemini_left -= g_used
+        total_gemini_used += g_used
         total_active += len(retry_ids)
         total_budget += rb
         total_fuel += rf
@@ -885,13 +1084,15 @@ def run_monitoring():
         set_sync_val("last_top_ts", new_top_ts)
 
     print(f"Найдено свежих активных тендеров: {len(fresh_active_ids)}")
-    b1, f1, s1, _ = evaluate_active_tenders(fresh_active_ids, gemini_left)
+    b1, f1, s1, g1 = evaluate_active_tenders(fresh_active_ids, gemini_left)
+    total_gemini_used += g1
     total_active += len(fresh_active_ids)
     total_budget += b1
     total_fuel += f1
     total_sent += s1
 
     check_results_for_participating_tenders()
+    sync_stats_to_crm(total_gemini_used)
 
     remaining_in_queue = len(get_retry_queue_ids())
     print("=========================================")
