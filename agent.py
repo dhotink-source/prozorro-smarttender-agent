@@ -65,6 +65,18 @@ ZERO_VAT_REGEX = re.compile(
     re.IGNORECASE
 )
 
+# Регулярные выражения для подстраховки поиска % превышения бюджета или запрета в ТД
+OVER_BUDGET_PERCENT_REGEX = re.compile(
+    r"відсоток\s+перевищення\s+ціни\s+тендерної\s+пропозиції[^.]{0,250}?не\s+більше\s+(?:ніж\s+)?(\d+(?:[.,]\d+)?)\s*%",
+    re.IGNORECASE | re.DOTALL
+)
+OVER_BUDGET_PROHIBITED_REGEX = re.compile(
+    r"(не\s+приймає(?:ться)?\s+до\s+розгляду\s+тендерн[ау]\s+пропозиці[яю],\s+ціна\s+якої\s+є\s+вищою|"
+    r"ціна\s+тендерної\s+пропозиції\s+не\s+може\s+перевищувати\s+очікувану\s+вартість|"
+    r"відхиляє\s+тендерну\s+пропозицію[^.]{0,120}?ціна\s+якої\s+перевищує\s+очікувану\s+вартість)",
+    re.IGNORECASE | re.DOTALL
+)
+
 # Очистка отображаемого текста пункта 1 от кодов ДК 021:2015 (при сохранении самого фильтра поиска по ДК)
 CPV_STRIP_REGEX = re.compile(
     r"(?:,?\s*\(?(?:код\s*)?(?:за\s*)?ДК\s*021:2015\s*[:\-–—]?\s*\d{8}-\d[^,.)]*\)?|,?\s*\b0913\d{4}-\d\b)",
@@ -262,10 +274,17 @@ def clean_and_enforce_source(text: str, default_source: str = "Договора"
 
     return pattern.sub(replacer, cleaned)
 
+def format_percent_clean(val: float) -> str:
+    if abs(val - round(val)) < 1e-6:
+        return str(int(round(val)))
+    return str(round(val, 2)).rstrip("0").rstrip(".")
+
+# Расчет бюджета с НДС и проверкой возможности подачи предложений сверх ожидаемой стоимости (4 сценария)
 def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str) -> dict:
     val = tender_data.get("value", {})
     budget_raw = float(val.get("amount", 0) or 0)
     prozorro_vat_included = bool(val.get("valueAddedTaxIncluded", False))
+    method_type = tender_data.get("procurementMethodType", "")
 
     ai_vat_rate = ai.get("vat_rate_percent", 20)
     is_zero_vat = (ai_vat_rate == 0) or bool(ZERO_VAT_REGEX.search(docs_text))
@@ -289,6 +308,9 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str)
     single_qty = 0.0
     unit_label = "ед."
 
+    is_single_item = False
+    base_display_num = 0.0
+
     if items_count == 1:
         single_qty = float(target_items[0].get("quantity", 0) or 0)
         unit_raw = str(target_items[0].get("unit", {}).get("name", "ед.")).lower()
@@ -302,25 +324,69 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str)
             unit_label = unit_raw
 
         if single_qty > 0:
-            unit_price_with_vat = (budget_raw / single_qty) * multiplier
-            budget_str = f"{unit_price_with_vat:,.2f} грн/{unit_label} {vat_label}".replace(",", " ")
-            return {
-                "budgetDisplay": budget_str,
-                "isZeroVat": is_zero_vat,
-                "vatRatePercent": vat_rate_num,
-                "itemsCount": 1,
-                "singleItemQty": single_qty,
-                "unitLabel": unit_label
-            }
+            is_single_item = True
+            base_display_num = (budget_raw / single_qty) * multiplier
+            base_budget_str = f"{base_display_num:,.2f} грн/{unit_label} {vat_label}".replace(",", " ")
+        else:
+            base_display_num = budget_raw * multiplier
+            base_budget_str = f"{base_display_num:,.2f} грн {vat_label}".replace(",", " ")
+    else:
+        base_display_num = budget_raw * multiplier
+        base_budget_str = f"{base_display_num:,.2f} грн {vat_label}".replace(",", " ")
 
-    total_with_vat = budget_raw * multiplier
-    budget_str = f"{total_with_vat:,.2f} грн {vat_label}".replace(",", " ")
+    # Определение политики превышения бюджета («Ціна пропозиції обмежена очікуваною вартістю: Ні / Так»)
+    ai_policy = str(ai.get("over_budget_policy", "") or "").strip().upper()
+    try:
+        over_pct = float(ai.get("over_budget_percent", 0) or 0)
+    except Exception:
+        over_pct = 0.0
+
+    # Дополнительная проверка регулярным выражением по тексту ТД (на случай, если ИИ пропустил цифру)
+    if over_pct <= 0 and docs_text:
+        m_pct = OVER_BUDGET_PERCENT_REGEX.search(docs_text)
+        if m_pct:
+            try:
+                over_pct = float(m_pct.group(1).replace(",", "."))
+                ai_policy = "ALLOWED_WITH_PERCENT"
+            except Exception:
+                pass
+        elif OVER_BUDGET_PROHIBITED_REGEX.search(docs_text) and method_type == "aboveThreshold":
+            ai_policy = "PROHIBITED_IN_TD"
+
+    # В процедуре «Открытые торги с особенностями» (aboveThreshold) параметр в объявлении Prozorro/SmartTender всегда «Ні»
+    announcement_allows_over_budget = (method_type == "aboveThreshold") or (over_pct > 0)
+
+    over_budget_suffix = ""
+    if announcement_allows_over_budget:
+        if over_pct > 0 or ai_policy == "ALLOWED_WITH_PERCENT":
+            pct_clean = format_percent_clean(over_pct)
+            real_val = base_display_num * (1.0 + over_pct / 100.0)
+            if is_single_item:
+                real_str = f"{real_val:,.2f} грн/{unit_label} с НДС".replace(",", " ")
+            else:
+                real_str = f"{real_val:,.2f} грн с НДС".replace(",", " ")
+            over_budget_suffix = (
+                f". Есть возможность подачи предложений сверх бюджета на +{pct_clean}%, "
+                f"то есть реальный бюджет закупки {real_str}"
+            )
+        elif ai_policy == "PROHIBITED_IN_TD":
+            over_budget_suffix = (
+                ". Внимание! Объявлением предусмотрена возможность подачи предложений сверх бюджета, "
+                "однако тендерной документацией эта возможность запрещена. Ошибка заказчика!"
+            )
+        else:
+            over_budget_suffix = (
+                ". Предусмотрена возможность подачи предложений сверх бюджета, "
+                "однако величина превышения бюджета в закупке не установлена."
+            )
+
+    full_budget_str = base_budget_str + over_budget_suffix
     return {
-        "budgetDisplay": budget_str,
+        "budgetDisplay": full_budget_str,
         "isZeroVat": is_zero_vat,
         "vatRatePercent": vat_rate_num,
-        "itemsCount": items_count,
-        "singleItemQty": 0.0,
+        "itemsCount": 1 if is_single_item else items_count,
+        "singleItemQty": single_qty if is_single_item else 0.0,
         "unitLabel": unit_label
     }
 
@@ -421,7 +487,7 @@ def parse_docx_bytes(file_bytes: bytes, filename: str) -> str:
                         last_txt = c_txt
                 if cells:
                     lines.append(" | ".join(cells))
-        return "\n".join(lines)[:45000]
+        return "\n".join(lines)[:75000]
     except Exception as e:
         return f"Ошибка чтения DOCX {filename}: {e}"
 
@@ -432,7 +498,7 @@ def parse_old_doc_bytes(file_bytes: bytes, filename: str) -> str:
             tmp.flush()
             res = subprocess.run(["antiword", tmp.name], capture_output=True, text=True, timeout=10)
             if res.returncode == 0 and res.stdout.strip():
-                return f"=== ДОКУМЕНТ (DOC): {filename} ===\n" + res.stdout[:45000]
+                return f"=== ДОКУМЕНТ (DOC): {filename} ===\n" + res.stdout[:75000]
     except Exception:
         pass
     return ""
@@ -457,7 +523,7 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
     def doc_priority(doc_item):
         t = doc_item.get("title", "").lower()
-        if any(k in t for k in ("догов", "контракт", "техніч", "документац", "додаток", "специфікац", "вимог", "оголош")):
+        if any(k in t for k in ("догов", "контракт", "техніч", "документац", "тд", "додаток", "специфікац", "вимог", "оголош")):
             return 0
         return 1
 
@@ -520,6 +586,10 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
     method_readable = PROCUREMENT_METHODS.get(method_type, "Открытые торги")
     statutory_dates_hint = build_statutory_dates_reference(tender_data)
 
+    # Для процедуры aboveThreshold («Відкриті торги з особливостями») в объявлении Prozorro параметр
+    # «Ціна пропозиції обмежена очікуваною вартістю» всегда равен «Ні»
+    is_price_limited_by_announcement = "Ні" if method_type == "aboveThreshold" else "Так"
+
     items_json = json.dumps(tender_data.get("items", []), ensure_ascii=False)
     lots_json = json.dumps(tender_data.get("lots", []), ensure_ascii=False)
     e_terms_json = json.dumps(tender_data.get("milestones", []), ensure_ascii=False)
@@ -529,7 +599,8 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
     ID закупки: {tender_data.get('tenderID', '')}
     Заголовок: {tender_data.get('title', '')}
     Описание: {tender_data.get('description', '')}
-    Вид процедуры: {method_readable}
+    Вид процедуры: {method_readable} ({method_type})
+    Параметр объявления «Ціна пропозиції обмежена очікуваною вартістю»: {is_price_limited_by_announcement}
     Бюджет закупки в системе Prozorro: {budget_amount} UAH (флаг valueAddedTaxIncluded: {vat_included_flag})
     Тендерное обеспечение в паспорте Prozorro: {guarantee_amount} UAH
     Справка по законным срокам процедуры: {statutory_dates_hint}
@@ -538,7 +609,7 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
     Электронные условия объявления Prozorro: {e_terms_json}
 
     ПОЛНЫЙ ТЕКСТ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ И ПРОЕКТА ДОГОВОРА:
-    {docs_text[:95000]}
+    {docs_text[:130000]}
     """
 
     contents = [prompt] + pdf_parts
@@ -552,10 +623,16 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
             "2. Если закупается авиатопливо (JET A-1, РТ, ТС-1), керосин (гас), газ, сжиженный газ, мазут или масла — СТРОГО верни is_relevant = false!\n"
             "3. Если основной предмет — талоны, топливные карты, скретч-карты или розничная заправка на АЗС — СТРОГО верни is_relevant = false!\n"
             "4. ПРОВЕРКА НДС (vat_rate_percent): Проверь проект договора и условия закупки. Если применяется ставка НДС 0% (ПДВ 0%, в т.ч. по Постановлению КМУ №178) — укажи vat_rate_percent = 0. Если стандартный НДС 20% — укажи vat_rate_percent = 20.\n"
-            "5. ЗАПРЕТ НА КОД ДК В ТЕКСТЕ ПУНКТА 1: В поле subject_grade_and_volume НЕ ПИШИ код классификатора ДК 021:2015 (например, не пиши 'код ДК 021:2015:09130000-9'). Указывай только наименование топлива, марку, сезонность и объем.\n"
-            "6. ЗАПРЕТ НА АНГЛИЦИЗМЫ: Никогда не используй английские названия полей Prozorro ('Milestones', 'Items', 'Lots'). Вместо 'п. 1 Milestones' пиши 'п. 1 Электронных условий объявления', вместо 'Items' — 'Номенклатура объявления'.\n"
-            "7. ФОРМУЛА ЦЕНЫ: Если цена формульная, выдели отдельно строку предварительной формулы (если она есть), строку окончательной формулы (одной строкой без переносов) и массив расшифровки каждого значения формулы.\n"
-            "8. РАСЧЕТ РАННЕЙ ДАТЫ ДОГОВОРА: Рассчитай самую раннюю законную дату подписания договора при нашей победе и максимальной оперативности заказчика. В случае противоречия сроков между ТД и законодательством приоритет у законодательства Украины.\n"
+            "5. ПРОВЕРКА ПРЕВЫШЕНИЯ ОЖИДАЕМОЙ СТОИМОСТИ (over_budget_policy и over_budget_percent):\n"
+            "   Изучи Тендерную документацию (особенно Раздел III 'Інструкція з підготовки тендерної пропозиції', Раздел V 'Оцінка тендерної пропозиції' и Додаток 'Методика оцінки') на предмет условия 'Прийнятний відсоток перевищення ціни тендерної пропозиції учасника над очікуваною вартістю предмета закупівлі' (п. 28 / п. 44 Постановления КМУ №1178):\n"
+            "   - Если в ТД указан конкретный допустимый процент превышения ожидаемой стоимости (например, 'не більше ніж 10%'): установи over_budget_policy = 'ALLOWED_WITH_PERCENT' и over_budget_percent = число процента (например, 10).\n"
+            "   - Если в объявлении стоит 'Ціна пропозиції обмежена очікуваною вартістю: Ні' (открытые торги с особенностями), но в тексте ТД заказчик ПРЯМО ЗАПРЕТИЛ подавать предложения выше ожидаемой стоимости (например, написано 'Замовник не приймає до розгляду тендерну пропозицію, ціна якої є вищою, ніж очікувана вартість' или 'ціна пропозиції не може перевищувати очікувану вартість'): установи over_budget_policy = 'PROHIBITED_IN_TD' и over_budget_percent = 0.\n"
+            "   - Если в объявлении стоит 'Ні', но ни в объявлении, ни в ТД процент превышения не указан и прямого запрета нет: установи over_budget_policy = 'UNSPECIFIED_IN_TD' и over_budget_percent = 0.\n"
+            "   - Если в объявлении стоит 'Так' (цена ограничена ожидаемой стоимостью): установи over_budget_policy = 'LIMITED_BY_ANNOUNCEMENT' и over_budget_percent = 0.\n"
+            "6. ЗАПРЕТ НА КОД ДК В ТЕКСТЕ ПУНКТА 1: В поле subject_grade_and_volume НЕ ПИШИ код классификатора ДК 021:2015 (например, не пиши 'код ДК 021:2015:09130000-9'). Указывай только наименование топлива, марку, сезонность и объем.\n"
+            "7. ЗАПРЕТ НА АНГЛИЦИЗМЫ: Никогда не используй английские названия полей Prozorro ('Milestones', 'Items', 'Lots'). Вместо 'п. 1 Milestones' пиши 'п. 1 Электронных условий объявления', вместо 'Items' — 'Номенклатура объявления'.\n"
+            "8. ФОРМУЛА ЦЕНЫ: Если цена формульная, выдели отдельно строку предварительной формулы (если она есть), строку окончательной формулы (одной строкой без переносов) и массив расшифровки каждого значения формулы.\n"
+            "9. РАСЧЕТ РАННЕЙ ДАТЫ ДОГОВОРА: Рассчитай самую раннюю законную дату подписания договора при нашей победе и максимальной оперативности заказчика. В случае противоречия сроков между ТД и законодательством приоритет у законодательства Украины.\n"
             "Все ответы формируй строго на русском языке без эмодзи."
         ),
         response_mime_type="application/json",
@@ -564,6 +641,14 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
             "properties": {
                 "is_relevant": {"type": "BOOLEAN"},
                 "vat_rate_percent": {"type": "INTEGER"},
+                "over_budget_policy": {
+                    "type": "STRING",
+                    "description": "Одно из значений: 'ALLOWED_WITH_PERCENT', 'PROHIBITED_IN_TD', 'UNSPECIFIED_IN_TD', 'LIMITED_BY_ANNOUNCEMENT'"
+                },
+                "over_budget_percent": {
+                    "type": "NUMBER",
+                    "description": "Процент допустимого превышения ожидаемой стоимости по ТД (например, 10), либо 0"
+                },
                 "subject_grade_and_volume": {
                     "type": "STRING",
                     "description": "Пункт 1: Наименование товара, марка топлива и точное количество с единицами измерения и ссылкой на пункт Договора/Объявления БЕЗ указания кода ДК 021:2015"
@@ -612,9 +697,9 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                 }
             },
             "required": [
-                "is_relevant", "vat_rate_percent", "subject_grade_and_volume",
-                "payment_terms", "is_formula_pricing", "preliminary_formula_line",
-                "final_formula_line", "formula_variables",
+                "is_relevant", "vat_rate_percent", "over_budget_policy", "over_budget_percent",
+                "subject_grade_and_volume", "payment_terms", "is_formula_pricing",
+                "preliminary_formula_line", "final_formula_line", "formula_variables",
                 "delivery_mode_and_location", "delivery_and_contract_term",
                 "bid_security_uah", "contract_security_details",
                 "earliest_contract_date_calculation",
@@ -744,7 +829,7 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str):
 
     formatted_formula_html = build_formatted_formula_html(ai)
 
-    # Строгий деловой текст карточки нового тендера (0 иконок, без кода ДК в п.1, без спойлера в п.4, без Reply-подсказки)
+    # Строгий деловой текст карточки нового тендера (0 иконок, без кода ДК в п.1, с расчетом превышения бюджета в п.2)
     card_html = (
         f"<b>Тендер:</b> <code>{html.escape(tender_ua_id)}</code> ({html.escape(procedure_clean)})\n"
         f"-----------------------------------------\n"
@@ -1415,7 +1500,7 @@ def check_tracked_and_background_tenders():
                 }
                 http_session.post(GOOGLE_WEB_APP_URL, json=update_payload, timeout=25)
 
-        # Фоновое обогащение таблицы (Победитель + Дата договора по всем тендерам таблицы для кнопки «✒️ История в нашей базе», $0.00 без ИИ)
+        # Фоновое обогащение таблицы (Победитель + Дата договора по всем тендерам таблицы для кнопки «✒️ База данных», $0.00 без ИИ)
         bg_updates = []
         for bg in bg_list[:15]:
             bg_ua_id = bg.get("tenderID", "")
