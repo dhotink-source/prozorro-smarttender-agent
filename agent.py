@@ -21,7 +21,6 @@ from google.genai import types
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
-# 1. Конфигурация ключей из GitHub Secrets
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GOOGLE_WEB_APP_URL = os.environ.get("GOOGLE_WEB_APP_URL")
 SECRET_BRIDGE_KEY = os.environ.get("SECRET_BRIDGE_KEY", "FUEL_TENDER_SECRET_2026")
@@ -29,10 +28,16 @@ SECRET_BRIDGE_KEY = os.environ.get("SECRET_BRIDGE_KEY", "FUEL_TENDER_SECRET_2026
 PROZORRO_API_BASE = "https://public-api.prozorro.gov.ua/api/2.5"
 MIN_AMOUNT_UAH = 2400000
 
-# Поиск в Prozorro идет строго по целевым кодам ДК 021:2015
 TARGET_CPV_PREFIXES = ("09130000", "09132", "09134")
 EXCLUDED_CPV_PREFIXES = ("09131", "09133", "09135")
-MAX_GEMINI_ANALYSES_PER_RUN = 15
+MAX_GEMINI_ANALYSES_PER_RUN = 25
+
+# Штатная глубина окна синхронизации — 60 страниц (до 6000 записей)
+# Разовая ретро-проверка строго с 30.10.2026 18:19 до текущего момента
+MAX_NORMAL_FEED_PAGES = 60
+MAX_BACKFILL_FEED_PAGES = 500
+RETRO_BACKFILL_KEY = "backfill_from_2026_10_30_1819"
+RETRO_BACKFILL_TARGET_TS = "2026-10-30T18:19:00+02:00"
 
 GEMINI_MODELS_FALLBACK = (
     "gemini-3-flash-preview",
@@ -56,14 +61,15 @@ MANDATORY_FUEL_REGEX = re.compile(
 COUPON_CARD_REGEX = re.compile(
     r"(талон|скретч|смарт-?карт|паливн[іи]х?\s+карт|топливн[ыи]х?\s+карт|картков[аоії]ю?\s+систем|"
     r"карточн[ао]й\s+систем|по\s+талонам|по\s+талонах|талонн[ао]й\s+систем|бланк[іи]?в?-дозвол|"
-    r"заправк[аи]\s+на\s+азс|відпуск\s+з\s+азс|відпуск.*на\s+азс|поставка.*на\s+азс|"
+    r"заправк[аи]\s+на\s+азс|відпуск\s+з\s+азс|відпуск(?:\s+\S+){0,6}\s+на\s+азс|"
+    r"поставка\s+та\s+передача\s+товару\s+здійснюється\s+на\s+азс|"
     r"мереж[аіу]\s+азс|сеть\s+азс|наявність\s+мережі\s+автозаправних)",
     re.IGNORECASE
 )
 
 BULK_KEYWORD_REGEX = re.compile(
     r"(налив|автоцистерн|бензовоз|вагон-?цистерн|залізничн\w+\s+цистерн|железнодорожн\w+\s+цистерн|"
-    r"слив\s+в\s+емкост|злив\s+в\s+ємност|в\s+резервуар)",
+    r"слив\s+в\s+емкост|злив\s+в\s+ємност|в\s+резервуар|паливозаправник)",
     re.IGNORECASE
 )
 
@@ -73,7 +79,6 @@ ZERO_VAT_REGEX = re.compile(
     re.IGNORECASE
 )
 
-# Поиск в ТД явного разрешения превышать бюджет с указанием процента (например, «не більше ніж 10%»)
 OVER_BUDGET_PERCENT_REGEX = re.compile(
     r"відсоток\s+перевищення\s+ціни\s+тендерної\s+пропозиції[^.]{0,250}?не\s+більше\s+(?:ніж\s+)?(\d+(?:[.,]\d+)?)\s*%",
     re.IGNORECASE | re.DOTALL
@@ -85,13 +90,11 @@ OVER_BUDGET_PROHIBITED_REGEX = re.compile(
     re.IGNORECASE | re.DOTALL
 )
 
-# Очистка отображаемого текста пункта 1 от кодов ДК 021:2015 (при сохранении самого фильтра поиска по ДК)
 CPV_STRIP_REGEX = re.compile(
     r"(?:,?\s*\(?(?:код\s*)?(?:за\s*)?ДК\s*021:2015\s*[:\-–—]?\s*\d{8}-\d[^,.)]*\)?|,?\s*\b0913\d{4}-\d\b)",
     re.IGNORECASE
 )
 
-# Удаление привязок к пунктам договора, ТД и объявления из компактной карточки нового тендера
 CLAUSE_REF_PAREN_REGEX = re.compile(
     r"\s*\((?:[^()]*?\b(?:п\.|пп\.|пункт|раздел|розділ|додаток|приложен|специфик|номенклатур|"
     r"электронн\w+\s+услов|електронн\w+\s+умов|договор|контракт|тд|оголошен|объявлен|проек\w+)[^()]*)\)",
@@ -181,7 +184,6 @@ def get_total_processed_count() -> int:
     row = cursor.fetchone()
     return int(row[0]) if row else 0
 
-# Проверка номенклатуры по целевым кодам ДК и ключевым словам топлива
 def is_valid_diesel_or_gasoline_tender(tender: dict) -> tuple[bool, str]:
     title_and_desc = f"{tender.get('title', '')} {tender.get('description', '')}"
     items = tender.get("items", [])
@@ -212,7 +214,6 @@ def is_valid_diesel_or_gasoline_tender(tender: dict) -> tuple[bool, str]:
 
     return True, "OK"
 
-# Первичный фильтр талонов/карточек (включая проверку поля milestones — электронных условий поставки)
 def is_strictly_coupons_or_cards(tender: dict) -> bool:
     full_header = f"{tender.get('title', '')} {tender.get('description', '')}"
     items_desc = " ".join(str(i.get("description", "")) for i in tender.get("items", []))
@@ -236,18 +237,16 @@ def is_strictly_coupons_or_cards(tender: dict) -> bool:
 
     return bool(COUPON_CARD_REGEX.search(combined_text))
 
-# Контрольный пост-фильтр на ответ ИИ (блокирует карточку, если в способе поставки оказались талоны/карты/АЗС)
 def is_post_ai_coupons_or_retail(ai: dict) -> bool:
     subj = str(ai.get("subject_grade_and_volume", "") or "")
     deliv = str(ai.get("delivery_mode_and_location", "") or "")
 
     if COUPON_CARD_REGEX.search(deliv) and not BULK_KEYWORD_REGEX.search(deliv):
         return True
-    if COUPON_CARD_REGEX.search(subj) and not BULK_KEYWORD_REGEX.search( f"{subj} {deliv}" ):
+    if COUPON_CARD_REGEX.search(subj) and not BULK_KEYWORD_REGEX.search(f"{subj} {deliv}"):
         return True
     return False
 
-# Получение ссылки на SmartTender + считывание реального параметра «Ціна пропозиції обмежена очікуваною вартістю» (Так / Ні)
 def fetch_smarttender_url_and_limit_flag(tender_ua_id: str) -> tuple[str, str]:
     gateway_url = f"https://smarttender.biz/government/details/{tender_ua_id}"
     final_url = gateway_url
@@ -329,7 +328,6 @@ def parse_iso_dt(iso_str: str):
     except Exception:
         return None
 
-# Очистка для кнопки «Особенности» и «Формула» (сохраняет ссылки на пункты договора, но убирает англицизмы)
 def clean_and_enforce_source(text: str, default_source: str = "Договора", strip_cpv: bool = False) -> str:
     if not text:
         return ""
@@ -355,7 +353,6 @@ def clean_and_enforce_source(text: str, default_source: str = "Договора"
 
     return pattern.sub(replacer, cleaned)
 
-# Компактная очистка пунктов 1, 3, 6, 7, 8, 9 самой карточки нового тендера (полное удаление ссылок на пункты договора/ТД/объявления)
 def strip_clause_references_for_card(text: str, strip_cpv: bool = False, is_security_field: bool = False) -> str:
     if not text:
         return "Не предусмотрено" if is_security_field else ""
@@ -363,7 +360,6 @@ def strip_clause_references_for_card(text: str, strip_cpv: bool = False, is_secu
     if strip_cpv:
         cleaned = CPV_STRIP_REGEX.sub("", cleaned)
 
-    # Удаляем скобки с упоминанием пунктов договора, ТД, приложений, электронных условий
     cleaned = CLAUSE_REF_PAREN_REGEX.sub("", cleaned)
     cleaned = CLAUSE_REF_TAIL_REGEX.sub("", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,;.")
@@ -379,7 +375,6 @@ def format_percent_clean(val: float) -> str:
         return str(int(round(val)))
     return str(round(val, 2)).rstrip("0").rstrip(".")
 
-# Расчет бюджета с учетом реального количества позиций в Спецификации ТД и параметра превышения бюджета
 def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str, price_limited_flag: str) -> dict:
     val = tender_data.get("value", {})
     budget_raw = float(val.get("amount", 0) or 0)
@@ -406,7 +401,6 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
     prozorro_items_count = len(target_items)
     ai_spec_items_count = int(ai.get("items_count_in_specification", 1) or 1)
 
-    # Если заказчик слепил несколько позиций топлива в 1 строку Prozorro, берем реальное число позиций из Спецификации ТД
     effective_items_count = max(prozorro_items_count, ai_spec_items_count)
 
     single_qty = 0.0
@@ -437,7 +431,6 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
         base_display_num = budget_raw * multiplier
         base_budget_str = f"{base_display_num:,.2f} грн {vat_label}".replace(",", " ")
 
-    # Определение политики превышения бюджета («Ціна пропозиції обмежена очікуваною вартістю: Ні / Так»)
     ai_policy = str(ai.get("over_budget_policy", "") or "").strip().upper()
     try:
         over_pct = float(ai.get("over_budget_percent", 0) or 0)
@@ -455,7 +448,6 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
         elif OVER_BUDGET_PROHIBITED_REGEX.search(docs_text) and price_limited_flag == "Ні":
             ai_policy = "PROHIBITED_IN_TD"
 
-    # Сценарии сверх бюджета срабатывают ТОЛЬКО если в объявлении стоит «Ні» (или в ТД прямо прописан % превышения)
     announcement_allows_over_budget = (price_limited_flag == "Ні") or (over_pct > 0 and price_limited_flag != "Так")
 
     over_budget_suffix = ""
@@ -522,7 +514,6 @@ def next_business_day(dt: datetime, days_to_add: int = 1) -> datetime:
             added += 1
     return cur
 
-# Предварительный математический расчет дат по законодательству (с выделением целевых дат договора в **...**)
 def build_statutory_dates_reference(tender_data: dict) -> str:
     method_type = tender_data.get("procurementMethodType", "")
     end_iso = tender_data.get("tenderPeriod", {}).get("endDate", "")
@@ -684,7 +675,6 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
 
     return "\n\n".join(extracted_texts), pdf_parts
 
-# Когнитивная экспертиза нового тендера через Gemini
 def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: list, price_limited_flag: str) -> dict:
     val = tender_data.get("value", {})
     budget_amount = val.get("amount", 0)
@@ -743,39 +733,17 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
             "type": "OBJECT",
             "properties": {
                 "is_relevant": {"type": "BOOLEAN"},
-                "items_count_in_specification": {
-                    "type": "INTEGER",
-                    "description": "Количество отдельных позиций/марок товара в Спецификации ТД (1, если только один товар; >1, если несколько)"
-                },
+                "items_count_in_specification": {"type": "INTEGER"},
                 "vat_rate_percent": {"type": "INTEGER"},
-                "over_budget_policy": {
-                    "type": "STRING",
-                    "description": "Одно из значений: 'ALLOWED_WITH_PERCENT', 'PROHIBITED_IN_TD', 'UNSPECIFIED_IN_TD', 'LIMITED_BY_ANNOUNCEMENT'"
-                },
-                "over_budget_percent": {
-                    "type": "NUMBER",
-                    "description": "Процент допустимого превышения ожидаемой стоимости по ТД (например, 10), либо 0"
-                },
-                "subject_grade_and_volume": {
-                    "type": "STRING",
-                    "description": "Пункт 1: Наименование товара, марка топлива и точное количество с единицами измерения БЕЗ кода ДК и БЕЗ ссылок на пункты договора/объявления"
-                },
-                "payment_terms": {
-                    "type": "STRING",
-                    "description": "Пункт 3: Условия и сроки оплаты БЕЗ ссылок на пункты договора/объявления"
-                },
+                "over_budget_policy": {"type": "STRING"},
+                "over_budget_percent": {"type": "NUMBER"},
+                "subject_grade_and_volume": {"type": "STRING"},
+                "payment_terms": {"type": "STRING"},
                 "is_formula_pricing": {"type": "BOOLEAN"},
-                "preliminary_formula_line": {
-                    "type": "STRING",
-                    "description": "Формула предварительной цены одной строкой (если есть в договоре), иначе пустая строка ''"
-                },
-                "final_formula_line": {
-                    "type": "STRING",
-                    "description": "Полная формула окончательной цены одной строкой с указанием пункта Договора (или 'Цена фиксированная')"
-                },
+                "preliminary_formula_line": {"type": "STRING"},
+                "final_formula_line": {"type": "STRING"},
                 "formula_variables": {
                     "type": "ARRAY",
-                    "description": "Расшифровка каждой переменной формулы по отдельности",
                     "items": {
                         "type": "OBJECT",
                         "properties": {
@@ -785,38 +753,14 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                         "required": ["symbol", "explanation"]
                     }
                 },
-                "delivery_mode_and_location": {
-                    "type": "STRING",
-                    "description": "Пункт 6: Базис поставки (Инкотермс), вид транспорта (наливом/бензовозами/ж-д цистернами) и адрес передачи товара БЕЗ ссылок на пункты договора"
-                },
-                "delivery_and_contract_term": {
-                    "type": "STRING",
-                    "description": "Пункт 7: Срок поставки партии от заявки, граничный срок поставки и срок действия договора БЕЗ ссылок на пункты договора"
-                },
-                "bid_security_uah": {
-                    "type": "STRING",
-                    "description": "Пункт 8: Размер тендерного обеспечения (или 'Не предусмотрено') БЕЗ ссылок на пункты ТД"
-                },
-                "contract_security_details": {
-                    "type": "STRING",
-                    "description": "Пункт 9: Размер и форма обеспечения выполнения договора (или 'Не предусмотрено') БЕЗ ссылок на пункты договора"
-                },
-                "earliest_contract_date_calculation": {
-                    "type": "STRING",
-                    "description": "Расчет ранней даты заключения договора, где ТОЛЬКО итоговые самые вероятные ранние даты заключения договора выделены в **ДД.ММ.ГГГГ**"
-                },
-                "features_pitfalls_and_risks": {
-                    "type": "STRING",
-                    "description": "Раздел 1 Особенностей: Особенности приема-передачи товара (с номерами пунктов Договора/ТД)"
-                },
-                "features_price_increase_rules": {
-                    "type": "STRING",
-                    "description": "Раздел 2 Особенностей: Условия для повышения цены (с номерами пунктов Договора)"
-                },
-                "features_penalties": {
-                    "type": "STRING",
-                    "description": "Раздел 3 Особенностей: Штрафные санкции (с номерами пунктов Договора)"
-                }
+                "delivery_mode_and_location": {"type": "STRING"},
+                "delivery_and_contract_term": {"type": "STRING"},
+                "bid_security_uah": {"type": "STRING"},
+                "contract_security_details": {"type": "STRING"},
+                "earliest_contract_date_calculation": {"type": "STRING"},
+                "features_pitfalls_and_risks": {"type": "STRING"},
+                "features_price_increase_rules": {"type": "STRING"},
+                "features_penalties": {"type": "STRING"}
             },
             "required": [
                 "is_relevant", "items_count_in_specification", "vat_rate_percent",
@@ -912,7 +856,6 @@ def build_formatted_formula_html(ai: dict) -> str:
 
     return "\n\n".join(blocks) if blocks else html.escape(final_f or "Формула указана в проекте договора.")
 
-# Сборка компактной карточки нового тендера (без привязок к пунктам договора/ТД и с обновленным порядком разделов в «Особенностях»)
 def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str, price_limited_flag: str):
     tender_ua_id = tender_data.get("tenderID", "Не указан")
     entity = tender_data.get("procuringEntity", {})
@@ -929,7 +872,6 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str
     raw_end_date = tender_data.get("tenderPeriod", {}).get("endDate", "")
     deadline_formatted = format_deadline_strict(raw_end_date)
 
-    # Компактные поля карточки без привязок к пунктам договора, ТД и объявления
     subject_vol_clean = strip_clause_references_for_card(ai.get("subject_grade_and_volume", ""), strip_cpv=True)
     payment_terms_clean = strip_clause_references_for_card(ai.get("payment_terms", ""))
     delivery_loc_clean = strip_clause_references_for_card(ai.get("delivery_mode_and_location", ""))
@@ -937,7 +879,6 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str
     bid_sec_clean = strip_clause_references_for_card(ai.get("bid_security_uah", ""), is_security_field=True)
     contract_sec_clean = strip_clause_references_for_card(ai.get("contract_security_details", ""), is_security_field=True)
 
-    # Подробные поля для кнопки «📋 Особенности» (со ссылками на пункты договора и новым порядком разделов)
     pitfalls_clean = clean_and_enforce_source(ai.get("features_pitfalls_and_risks", ""), "Договора")
     price_inc_clean = clean_and_enforce_source(ai.get("features_price_increase_rules", ""), "Договора")
     penalties_clean = clean_and_enforce_source(ai.get("features_penalties", ""), "Договора")
@@ -967,7 +908,6 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str
         f"<b>10) Ссылка на тендер:</b> <a href=\"{html.escape(tender_url)}\">{html.escape(tender_url)}</a>"
     )
 
-    # Новый порядок и названия разделов: 1. Прием-передача, 2. Условия для повышения цены, 3. Штрафные санкции
     features_detailed_text = (
         f"1. ОСОБЕННОСТИ ПРИЕМА-ПЕРЕДАЧИ ТОВАРА:\n"
         f"{pitfalls_clean}\n\n"
@@ -1230,7 +1170,6 @@ def check_tracked_and_background_tenders():
             events_for_admin = []
             state_changed = False
 
-            # 1. Контроль изменений в тендере
             cur_docs = {
                 d.get("id"): f"{d.get('title', '')}|{d.get('dateModified', '')}"
                 for d in (t_data.get("documents") or [])
@@ -1272,7 +1211,6 @@ def check_tracked_and_background_tenders():
                 state["rawBudgetAmount"] = new_budget_raw
                 state_changed = True
 
-            # 2. Напоминание Админу за 12 часов до окончания подачи предложений
             dt_end = parse_iso_dt(new_end_iso)
             if dt_end and t_status in ("active.enquiries", "active.tendering"):
                 hours_left = (dt_end - now_utc).total_seconds() / 3600.0
@@ -1287,7 +1225,6 @@ def check_tracked_and_background_tenders():
                     state["notified12hKey"] = rem_key
                     state_changed = True
 
-            # 3. Уведомление Админу о назначении времени аукциона и за 1 час до начала аукциона
             auc_start_iso = t_data.get("auctionPeriod", {}).get("startDate", "")
             if not auc_start_iso and t_data.get("lots"):
                 auc_start_iso = (t_data["lots"][0].get("auctionPeriod") or {}).get("startDate", "")
@@ -1320,7 +1257,6 @@ def check_tracked_and_background_tenders():
                         state["notifiedAuction1h"] = auc_1h_key
                         state_changed = True
 
-            # 4. Завершен прием заявок -> переход к ожиданию аукциона (active.auction)
             if t_status == "active.auction" and state.get("notifiedStage") != "stage_active_auction":
                 auc_time_str = format_deadline_strict(auc_start_iso) if auc_start_iso else "определяется системой Prozorro"
                 part_lines = []
@@ -1343,7 +1279,6 @@ def check_tracked_and_background_tenders():
                 state["liveMenuStatus"] = f"🔨 Ожидание электронного аукциона (старт: {auc_time_str})"
                 state_changed = True
 
-            # 5. Контроль дисквалификации лидера / любого участника
             rejected_seen = set(state.get("rejectedAwardsSeen") or [])
             pending_awards = [a for a in awards if a.get("status") == "pending"]
             active_awards = [a for a in awards if a.get("status") == "active"]
@@ -1388,7 +1323,6 @@ def check_tracked_and_background_tenders():
                     state["rejectedAwardsSeen"] = list(rejected_seen)
                     state_changed = True
 
-            # 6. Оценка предложений заказчиком (active.qualification / pending award)
             if pending_awards:
                 cur_aw = pending_awards[-1]
                 cur_aw_id = cur_aw.get("id", "")
@@ -1416,7 +1350,6 @@ def check_tracked_and_background_tenders():
                     state["liveMenuStatus"] = f"⏳ Оценка предложения заказчиком — рассматривается {leader_name} ({leader_price})"
                     state_changed = True
 
-            # 7. Уведомление Админу о предоставлении 24 часов на исправление ошибок
             seen_24h = set(state.get("seen24hIds") or [])
             for aw in awards:
                 supp = (aw.get("suppliers") or [{}])[0]
@@ -1444,7 +1377,6 @@ def check_tracked_and_background_tenders():
                             )
                             state_changed = True
 
-            # 8. Принятие заказчиком решения о намерении заключить договор (Акцепт)
             if active_awards:
                 win_aw = active_awards[-1]
                 win_aw_id = win_aw.get("id", "")
@@ -1474,7 +1406,6 @@ def check_tracked_and_background_tenders():
                     state["liveMenuStatus"] = f"🏆 {win_name} признан победителем — ожидается заключение договора"
                     state_changed = True
 
-            # 9. Подписание договора, отмена тендера или несостоявшиеся торги -> АВТООЧИСТКА из меню «Принимаем участие»
             active_contracts = [c for c in contracts if c.get("status") == "active"]
             if active_contracts or t_status == "complete":
                 c_obj = active_contracts[-1] if active_contracts else (contracts[-1] if contracts else {})
@@ -1532,7 +1463,6 @@ def check_tracked_and_background_tenders():
                 state["notifiedStage"] = "stage_cancelled"
                 state_changed = True
 
-            # 10. Вопросы заказчику, требования/жалобы в АМКУ и мониторинг ДАСУ (только для Админа)
             seen_questions = set(state.get("seenQuestions") or [])
             for q in (t_data.get("questions") or []):
                 q_id = q.get("id", "")
@@ -1789,13 +1719,22 @@ def run_monitoring():
         total_fuel += rf
         total_sent += rs
 
-    last_top_ts = get_sync_val("last_top_ts")
+    # Проверяем, выполнялась ли разовая ретроспективная проверка с 30.10.2026 18:19
+    backfill_done = get_sync_val(RETRO_BACKFILL_KEY) == "done"
+    if not backfill_done:
+        last_top_ts = RETRO_BACKFILL_TARGET_TS
+        max_pages = MAX_BACKFILL_FEED_PAGES
+        print(f"=== РАЗОВАЯ РЕТРОСПЕКТИВНАЯ ПРОВЕРКА ЛЕНТЫ С {RETRO_BACKFILL_TARGET_TS} ===")
+    else:
+        last_top_ts = get_sync_val("last_top_ts")
+        max_pages = MAX_NORMAL_FEED_PAGES
+        print("=== Проверка свежих изменений ленты Prozorro ===")
+
     new_top_ts = ""
     next_url = f"{PROZORRO_API_BASE}/tenders?descending=1&limit=100&opt_fields=status"
     fresh_active_ids = []
 
-    print("=== Проверка свежих изменений ленты Prozorro ===")
-    for page in range(1, 16):
+    for page in range(1, max_pages + 1):
         if not next_url:
             break
         resp = http_session.get(next_url, timeout=15).json()
@@ -1813,21 +1752,24 @@ def run_monitoring():
             status = item.get("status", "")
             mod_ts = item.get("dateModified", "")
 
+            if last_top_ts and mod_ts < last_top_ts:
+                reached_previous_window = True
+                continue
+
             if status in ("active.enquiries", "active.tendering") and not is_already_processed(t_id):
                 fresh_active_ids.append(t_id)
 
-            if last_top_ts and mod_ts < last_top_ts:
-                reached_previous_window = True
-
         next_url = resp.get("next_page", {}).get("uri")
         if reached_previous_window:
-            print(f"Окно синхронизации сомкнуто со штампом прошлого запуска ({last_top_ts}) на стр. {page}.")
+            print(f"Окно синхронизации сомкнуто со штампом ({last_top_ts}) на стр. {page}.")
             break
 
     if new_top_ts:
         set_sync_val("last_top_ts", new_top_ts)
+    if not backfill_done:
+        set_sync_val(RETRO_BACKFILL_KEY, "done")
 
-    print(f"Найдено свежих активных тендеров: {len(fresh_active_ids)}")
+    print(f"Найдено непроверенных активных тендеров в окне: {len(fresh_active_ids)}")
     b1, f1, s1, g1 = evaluate_active_tenders(fresh_active_ids, gemini_left)
     total_gemini_used += g1
     total_active += len(fresh_active_ids)
