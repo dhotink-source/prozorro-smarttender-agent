@@ -32,8 +32,6 @@ TARGET_CPV_PREFIXES = ("09130000", "09132", "09134")
 EXCLUDED_CPV_PREFIXES = ("09131", "09133", "09135")
 MAX_GEMINI_ANALYSES_PER_RUN = 25
 
-# Штатная глубина окна синхронизации — 60 страниц (до 6000 записей)
-# Разовая ретро-проверка строго с 30.10.2026 18:19 до текущего момента
 MAX_NORMAL_FEED_PAGES = 60
 MAX_BACKFILL_FEED_PAGES = 500
 RETRO_BACKFILL_KEY = "backfill_from_2026_10_30_1819"
@@ -484,19 +482,42 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
         "unitLabel": unit_label
     }
 
+# Определение ставки НДС по данным строки из Google Таблицы (без повторного вызова ИИ)
+def resolve_tracked_vat_rate(item: dict) -> int:
+    vat_col = str(item.get("vatRateColumn", "") or item.get("vatRateDisplay", "")).strip()
+    if vat_col in ("20%", "20"):
+        return 20
+    if vat_col in ("0%", "0"):
+        return 0
+
+    budget_str = str(item.get("budgetDisplay", "") or "")
+    if re.search(r"(?:ставка\s*НДС:\s*20%|ПДВ\s*20%|\b20%\s*ПДВ)", budget_str, re.IGNORECASE):
+        return 20
+    if re.search(r"(?:ставка\s*НДС:\s*0%|ПДВ\s*0%|\b0%\s*ПДВ)", budget_str, re.IGNORECASE):
+        return 0
+
+    if item.get("vatRatePercent") in (0, 20):
+        return int(item["vatRatePercent"])
+
+    return 0 if item.get("isZeroVat") else 20
+
+# Форматирование цены участника на основе ставки НДС из Google Таблицы:
+# если участники подались в Prozorro без НДС, а в таблице ставка 20% — начисляем +20% (x1.2)
 def format_participant_price_with_vat(
     raw_amount: float,
     bid_vat_included: bool,
-    is_zero_vat: bool,
+    tender_vat_included: bool,
+    vat_rate_percent: int,
     items_count: int,
     single_qty: float,
     unit_label: str
 ) -> str:
-    if is_zero_vat:
+    if int(vat_rate_percent) == 0:
         multiplier = 1.0
         vat_label = "с НДС (ставка НДС: 0%)"
     else:
-        multiplier = 1.0 if bid_vat_included else 1.2
+        submitted_without_vat = (not tender_vat_included) or (not bid_vat_included)
+        multiplier = 1.2 if submitted_without_vat else 1.0
         vat_label = "с НДС (ставка НДС: 20%)"
 
     total_with_vat = float(raw_amount or 0) * multiplier
@@ -935,6 +956,7 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str
             "budgetDisplay": budget_display_str,
             "isZeroVat": pricing_meta["isZeroVat"],
             "vatRatePercent": pricing_meta["vatRatePercent"],
+            "vatRateDisplay": f"{pricing_meta['vatRatePercent']}%",
             "itemsCount": pricing_meta["itemsCount"],
             "singleItemQty": pricing_meta["singleItemQty"],
             "unitLabel": pricing_meta["unitLabel"],
@@ -963,13 +985,14 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str
 
 def extract_participants_from_prozorro(
     t_data: dict,
-    is_zero_vat: bool,
+    vat_rate_percent: int,
     items_count: int,
     single_qty: float,
     unit_label: str
 ) -> tuple[list, int]:
     awards = t_data.get("awards", []) or []
     bids = t_data.get("bids", []) or []
+    tender_vat_included = bool(t_data.get("value", {}).get("valueAddedTaxIncluded", False))
 
     if items_count <= 0:
         items = t_data.get("items", [])
@@ -1039,9 +1062,9 @@ def extract_participants_from_prozorro(
 
             if val and val.get("amount") is not None:
                 raw_amt = float(val.get("amount", 0) or 0)
-                vat_inc = bool(val.get("valueAddedTaxIncluded", False))
+                bid_vat_inc = bool(val.get("valueAddedTaxIncluded", False))
                 price_formatted = format_participant_price_with_vat(
-                    raw_amt, vat_inc, is_zero_vat, items_count, single_qty, unit_label
+                    raw_amt, bid_vat_inc, tender_vat_included, vat_rate_percent, items_count, single_qty, unit_label
                 )
             else:
                 raw_amt = 999999999999.0 + idx
@@ -1071,7 +1094,7 @@ def extract_participants_from_prozorro(
             if val.get("amount") is None:
                 continue
             raw_amt = float(val.get("amount", 0) or 0)
-            vat_inc = bool(val.get("valueAddedTaxIncluded", False))
+            bid_vat_inc = bool(val.get("valueAddedTaxIncluded", False))
             has_24h = any(m.get("code") == "24h" for m in (aw.get("milestones") or []))
 
             if aw_status == "active":
@@ -1089,7 +1112,7 @@ def extract_participants_from_prozorro(
             seen_edrpou.add(key)
 
             price_formatted = format_participant_price_with_vat(
-                raw_amt, vat_inc, is_zero_vat, items_count, single_qty, unit_label
+                raw_amt, bid_vat_inc, tender_vat_included, vat_rate_percent, items_count, single_qty, unit_label
             )
             participants.append({
                 "rawAmount": raw_amt,
@@ -1149,7 +1172,8 @@ def check_tracked_and_background_tenders():
         for item in tracked_list:
             tender_ua_id = item.get("tenderID", "")
             lookup_id = item.get("prozorroInternalId") or tender_ua_id
-            is_zero_vat = bool(item.get("isZeroVat", False))
+            # Берем ставку НДС напрямую из Google Таблицы (установленную при первом анализе тендера, 0 токенов ИИ)
+            vat_rate_percent = resolve_tracked_vat_rate(item)
             items_count = int(item.get("itemsCount", 0) or 0)
             single_qty = float(item.get("singleItemQty", 0) or 0)
             unit_label = str(item.get("unitLabel", "литр") or "литр")
@@ -1160,10 +1184,11 @@ def check_tracked_and_background_tenders():
                 continue
 
             t_status = t_data.get("status", "")
+            tender_vat_included = bool(t_data.get("value", {}).get("valueAddedTaxIncluded", False))
             awards = t_data.get("awards", []) or []
             contracts = t_data.get("contracts", []) or []
             participants, items_count = extract_participants_from_prozorro(
-                t_data, is_zero_vat, items_count, single_qty, unit_label
+                t_data, vat_rate_percent, items_count, single_qty, unit_label
             )
 
             events_for_all = []
@@ -1300,7 +1325,9 @@ def check_tracked_and_background_tenders():
                         next_price = format_participant_price_with_vat(
                             float(nval.get("amount", 0) or 0),
                             bool(nval.get("valueAddedTaxIncluded", False)),
-                            is_zero_vat, items_count, single_qty, unit_label
+                            tender_vat_included,
+                            vat_rate_percent,
+                            items_count, single_qty, unit_label
                         )
                         transition_line = (
                             f"<b>Право заключения договора (оценка предложения) перешло к следующему участнику:</b>\n"
@@ -1333,10 +1360,13 @@ def check_tracked_and_background_tenders():
                 leader_price = format_participant_price_with_vat(
                     float(val.get("amount", 0) or 0),
                     bool(val.get("valueAddedTaxIncluded", False)),
-                    is_zero_vat, items_count, single_qty, unit_label
+                    tender_vat_included,
+                    vat_rate_percent,
+                    items_count, single_qty, unit_label
                 )
 
                 stage_key = f"pending_award_{cur_aw_id}"
+                new_menu_status = f"⏳ Оценка предложения заказчиком — рассматривается {leader_name} ({leader_price})"
                 if state.get("notifiedStage") != stage_key:
                     events_for_all.append({
                         "title": "📊 ОЦЕНКА ПРЕДЛОЖЕНИЙ (КВАЛИФИКАЦИЯ)",
@@ -1347,7 +1377,10 @@ def check_tracked_and_background_tenders():
                         "includeParticipants": True
                     })
                     state["notifiedStage"] = stage_key
-                    state["liveMenuStatus"] = f"⏳ Оценка предложения заказчиком — рассматривается {leader_name} ({leader_price})"
+                    state["liveMenuStatus"] = new_menu_status
+                    state_changed = True
+                elif state.get("liveMenuStatus") != new_menu_status:
+                    state["liveMenuStatus"] = new_menu_status
                     state_changed = True
 
             seen_24h = set(state.get("seen24hIds") or [])
@@ -1387,9 +1420,12 @@ def check_tracked_and_background_tenders():
                 win_price = format_participant_price_with_vat(
                     float(val.get("amount", 0) or 0),
                     bool(val.get("valueAddedTaxIncluded", False)),
-                    is_zero_vat, items_count, single_qty, unit_label
+                    tender_vat_included,
+                    vat_rate_percent,
+                    items_count, single_qty, unit_label
                 )
                 stage_key = f"active_award_{win_aw_id}"
+                new_win_summary = f"{win_name} ({win_price})"
                 if state.get("notifiedStage") != stage_key:
                     events_for_all.append({
                         "title": "🏆 ПРИНЯТО РЕШЕНИЕ О НАМЕРЕНИИ ЗАКЛЮЧИТЬ ДОГОВОР (АКЦЕПТ)",
@@ -1399,11 +1435,16 @@ def check_tracked_and_background_tenders():
                             f"• <b>Статус участника:</b> Признан победителем, ожидается заключение договора"
                         ),
                         "includeParticipants": True,
-                        "winnerSummary": f"{win_name} ({win_price})"
+                        "winnerSummary": new_win_summary
                     })
                     state["notifiedStage"] = stage_key
                     state["winnerName"] = win_name
-                    state["liveMenuStatus"] = f"🏆 {win_name} признан победителем — ожидается заключение договора"
+                    state["winnerSummary"] = new_win_summary
+                    state["liveMenuStatus"] = f"🏆 {win_name} признан победителем ({win_price}) — ожидается заключение договора"
+                    state_changed = True
+                elif state.get("winnerSummary") != new_win_summary:
+                    state["winnerSummary"] = new_win_summary
+                    state["liveMenuStatus"] = f"🏆 {win_name} признан победителем ({win_price}) — ожидается заключение договора"
                     state_changed = True
 
             active_contracts = [c for c in contracts if c.get("status") == "active"]
@@ -1719,7 +1760,6 @@ def run_monitoring():
         total_fuel += rf
         total_sent += rs
 
-    # Проверяем, выполнялась ли разовая ретроспективная проверка с 30.10.2026 18:19
     backfill_done = get_sync_val(RETRO_BACKFILL_KEY) == "done"
     if not backfill_done:
         last_top_ts = RETRO_BACKFILL_TARGET_TS
