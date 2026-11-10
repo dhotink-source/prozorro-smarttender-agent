@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -20,6 +21,11 @@ from google.genai import types
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
+
+try:
+    KYIV_TZ = ZoneInfo("Europe/Kyiv")
+except Exception:
+    KYIV_TZ = timezone(timedelta(hours=2))
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GOOGLE_WEB_APP_URL = os.environ.get("GOOGLE_WEB_APP_URL")
@@ -182,6 +188,16 @@ def get_total_processed_count() -> int:
     row = cursor.fetchone()
     return int(row[0]) if row else 0
 
+def normalize_unit_label(unit_raw: str) -> str:
+    u = str(unit_raw or "ед.").strip().lower()
+    if "літр" in u or "литр" in u or u == "л":
+        return "литр"
+    if "тон" in u or u == "т":
+        return "тонну"
+    if "кілогр" in u or "килогр" in u or u == "кг":
+        return "кг"
+    return u or "ед."
+
 def is_valid_diesel_or_gasoline_tender(tender: dict) -> tuple[bool, str]:
     title_and_desc = f"{tender.get('title', '')} {tender.get('description', '')}"
     items = tender.get("items", [])
@@ -300,6 +316,15 @@ def build_smarttender_url(tender_ua_id: str) -> str:
     url, _ = fetch_smarttender_url_and_limit_flag(tender_ua_id)
     return url
 
+def parse_iso_dt(iso_str: str):
+    if not iso_str:
+        return None
+    try:
+        clean = str(iso_str).strip().replace("Z", "+00:00")
+        return datetime.fromisoformat(clean)
+    except Exception:
+        return None
+
 def format_deadline_strict(iso_str: str) -> str:
     if not iso_str:
         return "Не указан"
@@ -312,19 +337,15 @@ def format_deadline_strict(iso_str: str) -> str:
 def format_date_only(iso_str: str) -> str:
     if not iso_str:
         return ""
+    dt = parse_iso_dt(iso_str)
+    if dt:
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(KYIV_TZ)
+        return dt.strftime("%d.%m.%Y")
     m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", str(iso_str))
     if m:
         return f"{m.group(3)}.{m.group(2)}.{m.group(1)}"
-    return str(iso_str)[:10]
-
-def parse_iso_dt(iso_str: str):
-    if not iso_str:
-        return None
-    try:
-        clean = str(iso_str).replace("Z", "+00:00")
-        return datetime.fromisoformat(clean)
-    except Exception:
-        return None
+    return ""
 
 def clean_and_enforce_source(text: str, default_source: str = "Договора", strip_cpv: bool = False) -> str:
     if not text:
@@ -408,15 +429,7 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
 
     if effective_items_count == 1 and prozorro_items_count == 1:
         single_qty = float(target_items[0].get("quantity", 0) or 0)
-        unit_raw = str(target_items[0].get("unit", {}).get("name", "ед.")).lower()
-        if "літр" in unit_raw or "литр" in unit_raw or unit_raw == "л":
-            unit_label = "литр"
-        elif "тон" in unit_raw or unit_raw == "т":
-            unit_label = "тонну"
-        elif "кілогр" in unit_raw or "килогр" in unit_raw or unit_raw == "кг":
-            unit_label = "кг"
-        else:
-            unit_label = unit_raw
+        unit_label = normalize_unit_label(target_items[0].get("unit", {}).get("name", "ед."))
 
         if single_qty > 0:
             is_single_item = True
@@ -482,7 +495,7 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
         "unitLabel": unit_label
     }
 
-# Определение ставки НДС по данным строки из Google Таблицы (без повторного вызова ИИ)
+# Определение ставки НДС строго по данным из Google Таблицы (0 токенов ИИ)
 def resolve_tracked_vat_rate(item: dict) -> int:
     vat_col = str(item.get("vatRateColumn", "") or item.get("vatRateDisplay", "")).strip()
     if vat_col in ("20%", "20"):
@@ -501,8 +514,7 @@ def resolve_tracked_vat_rate(item: dict) -> int:
 
     return 0 if item.get("isZeroVat") else 20
 
-# Форматирование цены участника на основе ставки НДС из Google Таблицы:
-# если участники подались в Prozorro без НДС, а в таблице ставка 20% — начисляем +20% (x1.2)
+# Форматирование цены участника на основе ставки НДС из Google Таблицы
 def format_participant_price_with_vat(
     raw_amount: float,
     bid_vat_included: bool,
@@ -526,6 +538,210 @@ def format_participant_price_with_vat(
         return f"{unit_price:,.2f} грн/{unit_label} {vat_label}".replace(",", " ")
     return f"{total_with_vat:,.2f} грн {vat_label}".replace(",", " ")
 
+# Приведение суммы или цены за единицу из карточки Договора Prozorro к цене с НДС по ставке из Google Таблицы
+def apply_sheet_vat_to_contract_amount(
+    amount: float,
+    val_vat_inc: bool,
+    amount_net: float,
+    tender_vat_inc: bool,
+    vat_rate_percent: int,
+    ref_net_amount: float = 0.0
+) -> float:
+    amt = float(amount or 0)
+    net = float(amount_net or 0)
+    ref_net = float(ref_net_amount or 0)
+
+    if int(vat_rate_percent) == 0:
+        return amt
+
+    if not val_vat_inc:
+        return amt * 1.2
+
+    # Если в карточке договора стоит флаг с НДС, проверяем, действительно ли заказчик начислил 20% НДС сверху
+    if net > 0:
+        if amt > net * 1.05:
+            return amt
+        if abs(amt - net) < 1.0 and not tender_vat_inc:
+            return amt * 1.2
+        return amt
+
+    if not tender_vat_inc and ref_net > 0:
+        if abs(amt - ref_net) < 0.05:
+            return amt * 1.2
+        if amt > ref_net * 1.10:
+            return amt
+
+    return amt
+
+# Извлечение реальной даты заключения договора из модуля контрактов Prozorro (без заглушек)
+def extract_real_contract_date(c_full: dict, c_stub: dict, t_data: dict) -> str:
+    candidates = [
+        c_full.get("dateSigned"),
+        c_stub.get("dateSigned"),
+        (c_full.get("period") or {}).get("startDate"),
+        (c_stub.get("period") or {}).get("startDate"),
+        c_full.get("date"),
+        c_stub.get("date"),
+        c_full.get("dateModified"),
+        c_stub.get("dateModified"),
+        c_full.get("dateCreated"),
+        t_data.get("dateModified"),
+    ]
+    for raw_ts in candidates:
+        formatted = format_date_only(raw_ts)
+        if formatted:
+            return formatted
+    return datetime.now(KYIV_TZ).strftime("%d.%m.%Y")
+
+# Извлечение номера договора из модуля контрактов Prozorro (или названия файла договора)
+def extract_contract_number_display(c_full: dict, c_stub: dict) -> str:
+    raw_num = str(c_full.get("contractNumber") or c_stub.get("contractNumber") or "").strip()
+
+    if not raw_num:
+        docs_list = (c_full.get("documents") or []) + (c_stub.get("documents") or [])
+        for d in docs_list:
+            title = str(d.get("title", ""))
+            m = re.search(r"(?:догов[іо]р\w*|контракт\w*)\s*№\s*([А-ЯІЇЄҐA-Z0-9\-\/]+)", title, re.IGNORECASE)
+            if m:
+                raw_num = m.group(1).strip()
+                break
+
+    if not raw_num:
+        return ""
+
+    clean_num = re.sub(r"^[№#]\s*", "", raw_num).strip()
+    if not clean_num:
+        return ""
+    if clean_num.lower() in ("б/н", "б\\н", "без номера", "бн"):
+        return "б/н"
+    return f"№ {clean_num}"
+
+# Полный сбор сведений о заключенном договоре (Победитель, Номер, Реальная дата, Цена за единицу с НДС из таблицы)
+def extract_signed_contract_summary(
+    t_data: dict,
+    c_full: dict,
+    c_stub: dict,
+    awards: list,
+    active_awards: list,
+    vat_rate_percent: int,
+    items_count: int,
+    single_qty: float,
+    unit_label: str,
+    fallback_winner_name: str = ""
+) -> dict:
+    tender_vat_included = bool(t_data.get("value", {}).get("valueAddedTaxIncluded", False))
+    vat_label = "с НДС (ставка НДС: 0%)" if int(vat_rate_percent) == 0 else "с НДС (ставка НДС: 20%)"
+
+    award_id = c_full.get("awardID") or c_stub.get("awardID") or ""
+    matched_aw = {}
+    if award_id:
+        for aw in awards:
+            if aw.get("id") == award_id:
+                matched_aw = aw
+                break
+    if not matched_aw and active_awards:
+        matched_aw = active_awards[-1]
+
+    # 1. Победитель и ЕГРПОУ
+    c_suppliers = c_full.get("suppliers") or c_stub.get("suppliers") or []
+    aw_suppliers = matched_aw.get("suppliers") or []
+    supp = c_suppliers[0] if c_suppliers else (aw_suppliers[0] if aw_suppliers else {})
+
+    win_name = str(supp.get("name") or fallback_winner_name or "Победитель определен").strip()
+    win_edrpou = str((supp.get("identifier") or {}).get("id") or "").strip()
+
+    # 2. Номер и реальная дата заключения договора
+    contract_number = extract_contract_number_display(c_full, c_stub)
+    date_signed = extract_real_contract_date(c_full, c_stub, t_data)
+
+    # 3. Цена за единицу товара с НДС (ставка НДС берется строго из Google Таблицы)
+    aw_val = matched_aw.get("value") or {}
+    aw_amount = float(aw_val.get("amount", 0) or 0)
+    aw_vat_inc = bool(aw_val.get("valueAddedTaxIncluded", False))
+    aw_net_ref = aw_amount if (not aw_vat_inc or not tender_vat_included) else (aw_amount / 1.2 if vat_rate_percent == 20 else aw_amount)
+
+    c_val = c_full.get("value") or c_stub.get("value") or {}
+    c_amount = float(c_val.get("amount", 0) or 0)
+    c_amount_net = float(c_val.get("amountNet", 0) or 0)
+    c_vat_inc = bool(c_val.get("valueAddedTaxIncluded", False))
+
+    c_items = c_full.get("items") or c_stub.get("items") or []
+    per_item_prices = []
+
+    if c_items:
+        for it in c_items:
+            u_obj = it.get("unit") or {}
+            u_val = u_obj.get("value") or {}
+            if u_val.get("amount") is not None:
+                u_amt_raw = float(u_val.get("amount", 0) or 0)
+                if u_amt_raw <= 0:
+                    continue
+                u_vat_inc = bool(u_val.get("valueAddedTaxIncluded", False))
+                u_lbl = normalize_unit_label(u_obj.get("name") or unit_label)
+                it_qty = float(it.get("quantity", 0) or single_qty or 0)
+                ref_unit_net = (aw_net_ref / it_qty) if (len(c_items) == 1 and it_qty > 0 and aw_net_ref > 0) else 0.0
+
+                # Если в самом договоре указаны и amount, и amountNet, проверяем реальное начисление НДС
+                u_with_vat = apply_sheet_vat_to_contract_amount(
+                    u_amt_raw,
+                    u_vat_inc,
+                    0.0,
+                    tender_vat_included or (c_amount_net > 0 and c_amount > c_amount_net * 1.05 and u_vat_inc),
+                    vat_rate_percent,
+                    ref_unit_net
+                )
+                it_desc = CPV_STRIP_REGEX.sub("", str(it.get("description") or "")).strip(" ,;.")
+                per_item_prices.append((it_desc, f"{u_with_vat:,.2f} грн/{u_lbl} {vat_label}".replace(",", " ")))
+
+    unit_price_display = ""
+    is_per_unit = True
+
+    if items_count == 1 and len(per_item_prices) == 1:
+        unit_price_display = per_item_prices[0][1]
+    elif len(per_item_prices) > 1:
+        unit_price_display = "; ".join(
+            f"{desc}: {p_str}" if desc else p_str
+            for desc, p_str in per_item_prices
+        )
+    else:
+        qty_to_use = single_qty
+        lbl_to_use = unit_label or "литр"
+        if items_count == 1 and len(c_items) == 1:
+            c_qty = float(c_items[0].get("quantity", 0) or 0)
+            if c_qty > 0:
+                qty_to_use = c_qty
+            c_u_name = (c_items[0].get("unit") or {}).get("name", "")
+            if c_u_name:
+                lbl_to_use = normalize_unit_label(c_u_name)
+
+        if c_amount > 0:
+            total_with_vat = apply_sheet_vat_to_contract_amount(
+                c_amount, c_vat_inc, c_amount_net, tender_vat_included, vat_rate_percent, aw_net_ref
+            )
+            if items_count == 1 and qty_to_use > 0:
+                u_price = total_with_vat / qty_to_use
+                unit_price_display = f"{u_price:,.2f} грн/{lbl_to_use} {vat_label}".replace(",", " ")
+            else:
+                is_per_unit = False
+                unit_price_display = f"{total_with_vat:,.2f} грн {vat_label}".replace(",", " ")
+        elif aw_amount > 0:
+            unit_price_display = format_participant_price_with_vat(
+                aw_amount, aw_vat_inc, tender_vat_included, vat_rate_percent, items_count, qty_to_use, lbl_to_use
+            )
+            is_per_unit = (items_count == 1 and qty_to_use > 0)
+        else:
+            is_per_unit = False
+            unit_price_display = f"Указана в договоре ({vat_label})"
+
+    return {
+        "winnerName": win_name,
+        "winnerEdrpou": win_edrpou,
+        "contractNumber": contract_number,
+        "contractDate": date_signed,
+        "priceDisplay": unit_price_display,
+        "isPerUnit": is_per_unit
+    }
+
 def next_business_day(dt: datetime, days_to_add: int = 1) -> datetime:
     cur = dt
     added = 0
@@ -538,7 +754,7 @@ def next_business_day(dt: datetime, days_to_add: int = 1) -> datetime:
 def build_statutory_dates_reference(tender_data: dict) -> str:
     method_type = tender_data.get("procurementMethodType", "")
     end_iso = tender_data.get("tenderPeriod", {}).get("endDate", "")
-    dt_end = parse_iso_dt(end_iso) or datetime.now(timezone(timedelta(hours=2)))
+    dt_end = parse_iso_dt(end_iso) or datetime.now(KYIV_TZ)
     d_str = dt_end.strftime("%d.%m.%Y (%H:%M)")
     d_only = dt_end.strftime("%d.%m.%Y")
     next_bd = next_business_day(dt_end, 1)
@@ -989,7 +1205,7 @@ def extract_participants_from_prozorro(
     items_count: int,
     single_qty: float,
     unit_label: str
-) -> tuple[list, int]:
+) -> tuple[list, int, float, str]:
     awards = t_data.get("awards", []) or []
     bids = t_data.get("bids", []) or []
     tender_vat_included = bool(t_data.get("value", {}).get("valueAddedTaxIncluded", False))
@@ -1005,15 +1221,12 @@ def extract_participants_from_prozorro(
         items_count = len(target_items)
         if items_count == 1:
             single_qty = float(target_items[0].get("quantity", 0) or 0)
-            unit_raw = str(target_items[0].get("unit", {}).get("name", "ед.")).lower()
-            if "літр" in unit_raw or "литр" in unit_raw or unit_raw == "л":
-                unit_label = "литр"
-            elif "тон" in unit_raw or unit_raw == "т":
-                unit_label = "тонну"
-            elif "кілогр" in unit_raw or "килогр" in unit_raw or unit_raw == "кг":
-                unit_label = "кг"
-            else:
-                unit_label = unit_raw
+            unit_label = normalize_unit_label(target_items[0].get("unit", {}).get("name", "ед."))
+    elif items_count == 1 and single_qty <= 0:
+        items = t_data.get("items", [])
+        if len(items) == 1:
+            single_qty = float(items[0].get("quantity", 0) or 0)
+            unit_label = normalize_unit_label(items[0].get("unit", {}).get("name", unit_label))
 
     award_by_bid = {}
     award_by_edrpou = {}
@@ -1123,7 +1336,7 @@ def extract_participants_from_prozorro(
             })
 
     participants.sort(key=lambda x: x["rawAmount"])
-    return participants, items_count
+    return participants, items_count, single_qty, unit_label
 
 def fetch_dasu_events_for_tenders(tracked_internal_ids: set) -> dict:
     dasu_by_tender = {}
@@ -1172,7 +1385,7 @@ def check_tracked_and_background_tenders():
         for item in tracked_list:
             tender_ua_id = item.get("tenderID", "")
             lookup_id = item.get("prozorroInternalId") or tender_ua_id
-            # Берем ставку НДС напрямую из Google Таблицы (установленную при первом анализе тендера, 0 токенов ИИ)
+            # Ставка НДС берется напрямую из Google Таблицы (0 токенов ИИ)
             vat_rate_percent = resolve_tracked_vat_rate(item)
             items_count = int(item.get("itemsCount", 0) or 0)
             single_qty = float(item.get("singleItemQty", 0) or 0)
@@ -1187,7 +1400,7 @@ def check_tracked_and_background_tenders():
             tender_vat_included = bool(t_data.get("value", {}).get("valueAddedTaxIncluded", False))
             awards = t_data.get("awards", []) or []
             contracts = t_data.get("contracts", []) or []
-            participants, items_count = extract_participants_from_prozorro(
+            participants, items_count, single_qty, unit_label = extract_participants_from_prozorro(
                 t_data, vat_rate_percent, items_count, single_qty, unit_label
             )
 
@@ -1241,8 +1454,8 @@ def check_tracked_and_background_tenders():
                 hours_left = (dt_end - now_utc).total_seconds() / 3600.0
                 rem_key = f"rem12h_{new_end_iso}"
                 if 0 < hours_left <= 12.0 and state.get("notified12hKey") != rem_key:
-                    kyiv_dt = dt_end.astimezone(timezone(timedelta(hours=2)))
-                    day_word = "Сегодня" if kyiv_dt.date() == now_utc.astimezone(timezone(timedelta(hours=2))).date() else "Завтра"
+                    kyiv_dt = dt_end.astimezone(KYIV_TZ)
+                    day_word = "Сегодня" if kyiv_dt.date() == now_utc.astimezone(KYIV_TZ).date() else "Завтра"
                     events_for_admin.append({
                         "title": "⏳ НАПОМИНАНИЕ О ДЕДЛАЙНЕ ПОДАЧИ (МЕНЕЕ 12 ЧАСОВ)",
                         "bodyHtml": f"<b>{day_word} в {kyiv_dt.strftime('%H:%M')} ({kyiv_dt.strftime('%d-%m-%Y')})</b> закрывается подача предложений по данному тендеру."
@@ -1447,28 +1660,59 @@ def check_tracked_and_background_tenders():
                     state["liveMenuStatus"] = f"🏆 {win_name} признан победителем ({win_price}) — ожидается заключение договора"
                     state_changed = True
 
+            # 9. Заключение договора -> запрос полных данных контракта из /api/2.5/contracts/{id}, расчет цены с НДС из таблицы и автоочистка меню
             active_contracts = [c for c in contracts if c.get("status") == "active"]
             if active_contracts or t_status == "complete":
-                c_obj = active_contracts[-1] if active_contracts else (contracts[-1] if contracts else {})
-                date_signed = format_date_only(c_obj.get("dateSigned") or c_obj.get("dateModified") or "")
-                win_name = state.get("winnerName") or ""
-                if not win_name and active_awards:
-                    win_name = ((active_awards[-1].get("suppliers") or [{}])[0]).get("name", "Победитель")
+                c_stub = active_contracts[-1] if active_contracts else (contracts[-1] if contracts else {})
+                c_uuid = str(c_stub.get("id", "") or "")
+                c_full = fetch_contract_detail(c_uuid) if c_uuid else {}
+
+                c_info = extract_signed_contract_summary(
+                    t_data=t_data,
+                    c_full=c_full,
+                    c_stub=c_stub,
+                    awards=awards,
+                    active_awards=active_awards,
+                    vat_rate_percent=vat_rate_percent,
+                    items_count=items_count,
+                    single_qty=single_qty,
+                    unit_label=unit_label,
+                    fallback_winner_name=state.get("winnerName", "")
+                )
+
+                win_name = c_info["winnerName"]
+                win_edrpou = c_info["winnerEdrpou"]
+                contract_num = c_info["contractNumber"]
+                date_signed = c_info["contractDate"]
+                price_display = c_info["priceDisplay"]
+                price_label = "Цена за единицу товара" if c_info["isPerUnit"] else "Цена договора"
+
+                winner_html = f"<b>{html.escape(win_name)}</b>"
+                if win_edrpou:
+                    winner_html += f" (ЕГРПОУ: {html.escape(win_edrpou)})"
+
+                contract_lines = [
+                    f"• <b>Победитель:</b> {winner_html}",
+                    f"• <b>{price_label}:</b> <b>{html.escape(price_display)}</b>",
+                ]
+                if contract_num:
+                    contract_lines.append(f"• <b>Номер договора:</b> {html.escape(contract_num)}")
+                contract_lines.append(f"• <b>Дата заключения договора:</b> {html.escape(date_signed)}")
 
                 if state.get("notifiedStage") != "stage_contract_signed":
                     events_for_all.append({
                         "title": "🤝 ЗАКЛЮЧЕН ДОГОВОР ПО ТЕНДЕРУ",
-                        "bodyHtml": (
-                            f"• <b>Победитель:</b> <b>{html.escape(win_name or 'Определен')}</b>\n"
-                            f"• <b>Дата заключения договора:</b> <b>{html.escape(date_signed or 'Зарегистрирован в Prozorro')}</b>\n"
-                            f"• <b>Статус в меню:</b> Тендер завершен и автоматически убран из активного списка «Принимаем участие»."
-                        ),
+                        "hideBudget": True,
+                        "bodyHtml": "\n".join(contract_lines),
+                        "footerHtml": "<b>Статус в меню:</b> Тендер завершен и автоматически убран из активного списка «Принимаем участие».",
                         "closeParticipationMenu": "Договор заключен",
-                        "winnerName": win_name,
+                        "winnerName": f"{win_name} ({price_display})",
+                        "contractNumber": contract_num,
                         "contractDate": date_signed
                     })
                     state["notifiedStage"] = "stage_contract_signed"
                     state["winnerName"] = win_name
+                    state["contractNumber"] = contract_num
                     state["contractDate"] = date_signed
                     state_changed = True
 
@@ -1603,17 +1847,21 @@ def check_tracked_and_background_tenders():
             bg_awards = [a for a in (t_bg.get("awards") or []) if a.get("status") == "active"]
 
             if bg_contracts or bg_status == "complete":
-                c_obj = bg_contracts[-1] if bg_contracts else ((t_bg.get("contracts") or [{}])[-1])
-                c_date = format_date_only(c_obj.get("dateSigned") or c_obj.get("dateModified") or "")
-                w_name = ""
-                if bg_awards:
+                c_stub = bg_contracts[-1] if bg_contracts else ((t_bg.get("contracts") or [{}])[-1])
+                c_uuid = str(c_stub.get("id", "") or "")
+                c_full = fetch_contract_detail(c_uuid) if c_uuid else {}
+                c_date = extract_real_contract_date(c_full, c_stub, t_bg)
+
+                c_supps = c_full.get("suppliers") or c_stub.get("suppliers") or []
+                w_name = c_supps[0].get("name", "") if c_supps else ""
+                if not w_name and bg_awards:
                     w_name = ((bg_awards[-1].get("suppliers") or [{}])[0]).get("name", "")
                 if w_name:
                     bg_updates.append({
                         "yearStr": bg.get("yearStr"),
                         "tenderID": bg_ua_id,
                         "winnerName": w_name,
-                        "contractDate": c_date or "Подписан"
+                        "contractDate": c_date
                     })
 
         if bg_updates:
@@ -1657,6 +1905,21 @@ def fetch_tender_detail(t_id: str) -> dict:
             r = http_session.get(f"{PROZORRO_API_BASE}/tenders/{t_id}", timeout=12)
             if r.status_code == 200:
                 return r.json().get("data", {})
+            elif r.status_code == 429:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+        except Exception:
+            pass
+    return {}
+
+def fetch_contract_detail(contract_id: str) -> dict:
+    if not contract_id:
+        return {}
+    for attempt in range(3):
+        try:
+            r = http_session.get(f"{PROZORRO_API_BASE}/contracts/{contract_id}", timeout=12)
+            if r.status_code == 200:
+                return r.json().get("data", {}) or {}
             elif r.status_code == 429:
                 time.sleep(1.5 * (attempt + 1))
                 continue
