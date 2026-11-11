@@ -1952,48 +1952,70 @@ def check_tracked_and_background_tenders():
 
             auc_start_iso = t_data.get("auctionPeriod", {}).get("startDate", "")
             auc_display_str = format_deadline_strict(auc_start_iso) if auc_start_iso else ""
-            if not auc_start_iso and lot_meta_by_id:
+            upcoming_auc_isos = []
+
+            if auc_start_iso:
+                dt_root_auc = parse_iso_dt(auc_start_iso)
+                if dt_root_auc and dt_root_auc > now_utc:
+                    upcoming_auc_isos.append((auc_start_iso, auc_display_str))
+            elif lot_meta_by_id:
                 lot_auc_pairs = [
                     (lm["lotLabel"], lm["auctionStartIso"])
                     for lm in sorted(lot_meta_by_id.values(), key=lambda x: x["lotNum"])
-                    if lm["auctionStartIso"]
+                    if lm["auctionStartIso"] and lm["lotStatus"] == "active"
                 ]
                 if lot_auc_pairs:
                     auc_start_iso = min(p[1] for p in lot_auc_pairs)
                     auc_display_str = "; ".join(f"{lbl}: {format_deadline_strict(iso)}" for lbl, iso in lot_auc_pairs)
-            elif not auc_start_iso and t_data.get("lots"):
-                auc_start_iso = (t_data["lots"][0].get("auctionPeriod") or {}).get("startDate", "")
+                    for lbl, iso in lot_auc_pairs:
+                        dt_l = parse_iso_dt(iso)
+                        if dt_l and dt_l > now_utc:
+                            upcoming_auc_isos.append((iso, f"{lbl} — {format_deadline_strict(iso)}"))
+            elif t_data.get("lots"):
+                active_single_lots = [l for l in (t_data.get("lots") or []) if l.get("status", "active") == "active"]
+                target_lot_obj = active_single_lots[0] if active_single_lots else t_data["lots"][0]
+                auc_start_iso = (target_lot_obj.get("auctionPeriod") or {}).get("startDate", "")
                 auc_display_str = format_deadline_strict(auc_start_iso) if auc_start_iso else ""
+                dt_single_auc = parse_iso_dt(auc_start_iso)
+                if dt_single_auc and dt_single_auc > now_utc:
+                    upcoming_auc_isos.append((auc_start_iso, auc_display_str))
 
-            auc_url = t_data.get("auctionUrl", "") or build_smarttender_url(tender_ua_id)
-
-            if auc_start_iso:
-                auc_set_key = auc_display_str or auc_start_iso
-                if state.get("notifiedAuctionSet") != auc_set_key:
-                    events_for_admin.append({
-                        "title": "🔔 НАЗНАЧЕНО ВРЕМЯ ЭЛЕКТРОННОГО АУКЦИОНА",
-                        "bodyHtml": (
-                            f"• <b>Дата и время старта аукциона:</b> <b>{html.escape(auc_display_str)}</b>\n"
-                            f"• <b>Ссылка на вход в аукцион:</b> <a href=\"{html.escape(auc_url)}\">{html.escape(auc_url)}</a>"
-                        )
-                    })
-                    state["notifiedAuctionSet"] = auc_set_key
-                    state_changed = True
-
-                dt_auc = parse_iso_dt(auc_start_iso)
-                if dt_auc:
-                    mins_to_auc = (dt_auc - now_utc).total_seconds() / 60.0
-                    auc_1h_key = f"auc1h_{auc_start_iso}"
-                    if 0 < mins_to_auc <= 65.0 and state.get("notifiedAuction1h") != auc_1h_key:
+            # Уведомление о назначенном времени аукциона и напоминание за 1 час отправляются
+            # строго ПО ИСТЕЧЕНИИ срока на подачу предложений (в статусе ожидания аукциона active.auction)
+            submission_deadline_passed = (dt_end is None) or (now_utc >= dt_end)
+            if auc_start_iso and t_status == "active.auction" and submission_deadline_passed:
+                if upcoming_auc_isos:
+                    auc_set_key = auc_display_str or auc_start_iso
+                    if state.get("notifiedAuctionPostDeadline") != auc_set_key:
                         events_for_admin.append({
-                            "title": "🔔 НАПОМИНАНИЕ: ЧЕРЕЗ 1 ЧАС СТАРТ АУКЦИОНА",
-                            "bodyHtml": (
-                                f"• <b>Старт аукциона:</b> <b>{html.escape(auc_display_str)}</b>\n"
-                                f"• <b>Ссылка на вход в аукцион:</b> <a href=\"{html.escape(auc_url)}\">{html.escape(auc_url)}</a>"
-                            )
+                            "title": "🔔 НАЗНАЧЕНО ВРЕМЯ ЭЛЕКТРОННОГО АУКЦИОНА",
+                            "bodyHtml": f"• <b>Дата и время старта аукциона:</b> <b>{html.escape(auc_display_str)}</b>"
                         })
-                        state["notifiedAuction1h"] = auc_1h_key
+                        state["notifiedAuctionPostDeadline"] = auc_set_key
                         state_changed = True
+
+                seen_1h_keys = set(state.get("notifiedAuction1hList") or [])
+                if state.get("notifiedAuction1h"):
+                    seen_1h_keys.add(state["notifiedAuction1h"])
+
+                due_1h_labels = []
+                for up_iso, up_label in upcoming_auc_isos:
+                    dt_up = parse_iso_dt(up_iso)
+                    if not dt_up:
+                        continue
+                    mins_to_auc = (dt_up - now_utc).total_seconds() / 60.0
+                    auc_1h_key = f"auc1h_{up_iso}"
+                    if 0 < mins_to_auc <= 65.0 and auc_1h_key not in seen_1h_keys:
+                        due_1h_labels.append(up_label)
+                        seen_1h_keys.add(auc_1h_key)
+
+                if due_1h_labels:
+                    events_for_admin.append({
+                        "title": "🔔 НАПОМИНАНИЕ: ЧЕРЕЗ 1 ЧАС СТАРТ АУКЦИОНА",
+                        "bodyHtml": f"• <b>Старт аукциона:</b> <b>{html.escape('; '.join(due_1h_labels))}</b>"
+                    })
+                    state["notifiedAuction1hList"] = list(seen_1h_keys)
+                    state_changed = True
 
             if t_status == "active.auction" and state.get("notifiedStage") != "stage_active_auction":
                 auc_time_str = auc_display_str if auc_display_str else "определяется системой Prozorro"
