@@ -24,9 +24,26 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Кэш утилиты antiword для чтения .doc
+        uses: actions/cache@v4
+        with:
+          path: ~/.antiword-deb
+          key: antiword-deb-${{ runner.os }}-${{ runner.arch }}-v1
+
       - name: 3. Установка необходимых библиотек
         run: |
-          sudo apt-get update && sudo apt-get install -y antiword
+          mkdir -p ~/.antiword-deb
+          if ! ls ~/.antiword-deb/*.deb >/dev/null 2>&1; then
+            (
+              cd ~/.antiword-deb
+              if ! timeout 25s apt-get download antiword; then
+                printf "https://mirrors.edge.kernel.org/ubuntu/\nhttps://mirrors.wikimedia.org/ubuntu/\n" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+                sudo apt-get update -o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 || true
+                apt-get download antiword || curl -fsSL --connect-timeout 10 "https://mirrors.edge.kernel.org/ubuntu/pool/universe/a/antiword/antiword_0.37-17_amd64.deb" -o antiword_0.37-17_amd64.deb
+              fi
+            )
+          fi
+          sudo dpkg -i ~/.antiword-deb/*.deb
           pip install -r requirements.txt
 
       - name: 4. Запуск анализа Prozorro и отправки в SmartTender CRM
