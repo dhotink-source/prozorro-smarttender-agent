@@ -108,6 +108,10 @@ CLAUSE_REF_TAIL_REGEX = re.compile(
     r"(?:[,;]\s*|\s+)(?:согласно|згідно\s+з?)\s+(?:п\.|пп\.|пункт|раздел|додаток|приложен|специфик|номенклатур)[^.;]*$",
     re.IGNORECASE
 )
+LOT_PREFIX_STRIP_REGEX = re.compile(
+    r"^(?:[•\-*]\s*)?лот\s*№?\s*\d+\s*[:\-–—.]?\s*",
+    re.IGNORECASE
+)
 
 PROCUREMENT_METHODS = {
     "aboveThreshold": "Открытые торги с особенностями",
@@ -198,7 +202,141 @@ def normalize_unit_label(unit_raw: str) -> str:
         return "кг"
     return u or "ед."
 
+def format_qty_with_unit(qty: float, unit_label: str) -> str:
+    if abs(qty - round(qty)) < 1e-6:
+        q_str = f"{int(round(qty)):,}".replace(",", " ")
+    else:
+        q_str = f"{qty:,.2f}".replace(",", " ").rstrip("0").rstrip(".")
+
+    if unit_label == "литр":
+        u_plural = "литров"
+    elif unit_label == "тонну":
+        u_plural = "тонн"
+    else:
+        u_plural = unit_label
+    return f"{q_str} {u_plural}"
+
+def extract_lot_number_and_label(lot: dict, idx: int) -> tuple[int, str]:
+    title = str(lot.get("title", "") or "").strip()
+    m = re.search(r"\bлот\s*№?\s*(\d+)\b", title, re.IGNORECASE)
+    if m:
+        num = int(m.group(1))
+        return num, f"Лот {num}"
+    return idx, f"Лот {idx}"
+
+# Извлечение структуры целевых активных лотов из паспорта закупки Prozorro
+def extract_target_lots_info(tender_data: dict, include_closed: bool = False) -> list[dict]:
+    all_lots = tender_data.get("lots") or []
+    if not all_lots:
+        return []
+
+    all_items = tender_data.get("items") or []
+    tender_header = f"{tender_data.get('title', '')} {tender_data.get('description', '')}"
+    tender_vat_inc = bool((tender_data.get("value") or {}).get("valueAddedTaxIncluded", False))
+
+    result_lots = []
+    for idx, lot in enumerate(all_lots, start=1):
+        lot_status = str(lot.get("status", "active") or "active")
+        if not include_closed and lot_status != "active":
+            continue
+
+        lot_id = str(lot.get("id", "") or "")
+        lot_num, lot_label = extract_lot_number_and_label(lot, idx)
+
+        lot_items = [it for it in all_items if str(it.get("relatedLot", "") or "") == lot_id]
+        if not lot_items and len(all_lots) == 1:
+            lot_items = list(all_items)
+
+        fuel_items = []
+        for it in lot_items:
+            cpv = str(it.get("classification", {}).get("id", ""))
+            desc = str(it.get("description", ""))
+            if cpv.startswith(EXCLUDED_CPV_PREFIXES):
+                continue
+            if cpv and not cpv.startswith(TARGET_CPV_PREFIXES):
+                continue
+            if EXCLUDED_FUEL_REGEX.search(desc) and not MANDATORY_FUEL_REGEX.search(desc):
+                continue
+            fuel_items.append(it)
+
+        if lot_items and not fuel_items:
+            continue
+
+        items_text = " ".join(str(i.get("description", "")) for i in fuel_items)
+        lot_own_text = f"{lot.get('title', '')} {lot.get('description', '')} {items_text}".strip()
+        full_lot_check = f"{lot_own_text} {tender_header}".strip()
+
+        if EXCLUDED_FUEL_REGEX.search(lot_own_text) and not MANDATORY_FUEL_REGEX.search(items_text or lot_own_text):
+            continue
+        if not MANDATORY_FUEL_REGEX.search(full_lot_check):
+            continue
+        if COUPON_CARD_REGEX.search(lot_own_text) and not BULK_KEYWORD_REGEX.search(lot_own_text):
+            continue
+
+        lot_val = lot.get("value") or {}
+        lot_budget_raw = float(lot_val.get("amount", 0) or 0)
+        lot_vat_inc = bool(lot_val.get("valueAddedTaxIncluded", tender_vat_inc))
+
+        target_for_qty = fuel_items if fuel_items else lot_items
+        prozorro_items_count = len(target_for_qty)
+        units_set = {
+            normalize_unit_label((i.get("unit") or {}).get("name", "ед."))
+            for i in target_for_qty
+        }
+        unit_label = next(iter(units_set)) if len(units_set) == 1 else "литр"
+        total_qty = sum(float(i.get("quantity", 0) or 0) for i in target_for_qty) if len(units_set) == 1 else 0.0
+        single_qty = float(target_for_qty[0].get("quantity", 0) or 0) if prozorro_items_count == 1 else total_qty
+
+        fallback_desc_parts = []
+        for i in target_for_qty:
+            d_clean = CPV_STRIP_REGEX.sub("", str(i.get("description", "") or "")).strip(" ,;.")
+            q_val = float(i.get("quantity", 0) or 0)
+            u_lbl = normalize_unit_label((i.get("unit") or {}).get("name", "ед."))
+            if d_clean and q_val > 0:
+                fallback_desc_parts.append(f"{d_clean}, {format_qty_with_unit(q_val, u_lbl)}")
+            elif d_clean:
+                fallback_desc_parts.append(d_clean)
+
+        result_lots.append({
+            "lotId": lot_id,
+            "lotNum": lot_num,
+            "lotLabel": lot_label,
+            "lotTitle": str(lot.get("title", "") or "").strip(),
+            "lotStatus": lot_status,
+            "budgetRaw": lot_budget_raw,
+            "vatIncluded": lot_vat_inc,
+            "prozorroItemsCount": prozorro_items_count,
+            "sameUnitAcrossItems": len(units_set) == 1,
+            "singleQty": single_qty,
+            "totalQty": total_qty,
+            "unitLabel": unit_label,
+            "auctionStartIso": str((lot.get("auctionPeriod") or {}).get("startDate", "") or ""),
+            "auctionUrl": str(lot.get("auctionUrl", "") or ""),
+            "fallbackSubject": "; ".join(fallback_desc_parts) if fallback_desc_parts else str(lot.get("title", "") or ""),
+            "itemsRaw": [
+                {
+                    "description": i.get("description", ""),
+                    "quantity": i.get("quantity", 0),
+                    "unit": (i.get("unit") or {}).get("name", "")
+                }
+                for i in target_for_qty
+            ]
+        })
+
+    result_lots.sort(key=lambda x: x["lotNum"])
+    return result_lots
+
 def is_valid_diesel_or_gasoline_tender(tender: dict) -> tuple[bool, str]:
+    lots = tender.get("lots") or []
+    if len(lots) > 1:
+        target_lots = extract_target_lots_info(tender, include_closed=False)
+        if not target_lots:
+            return False, "Нет активных целевых лотов бензина/ДТ наливом"
+        sum_lot_budgets = sum(l["budgetRaw"] for l in target_lots)
+        if sum_lot_budgets > 0 and sum_lot_budgets < MIN_AMOUNT_UAH:
+            return False, "Сумма активных целевых лотов меньше 2.4 млн грн"
+        return True, "OK"
+
     title_and_desc = f"{tender.get('title', '')} {tender.get('description', '')}"
     items = tender.get("items", [])
 
@@ -242,22 +380,36 @@ def is_strictly_coupons_or_cards(tender: dict) -> bool:
 
     lots = tender.get("lots", [])
     if len(lots) > 1:
-        active_lots = [l for l in lots if l.get("status", "active") == "active"]
-        if active_lots:
-            return all(
-                bool(COUPON_CARD_REGEX.search(f"{l.get('title', '')} {l.get('description', '')}"))
-                for l in active_lots
-            )
+        target_lots = extract_target_lots_info(tender, include_closed=False)
+        if not target_lots:
+            return True
+        if COUPON_CARD_REGEX.search(f"{full_header} {milestones_desc}"):
+            return True
+        return False
 
     return bool(COUPON_CARD_REGEX.search(combined_text))
 
-def is_post_ai_coupons_or_retail(ai: dict) -> bool:
-    subj = str(ai.get("subject_grade_and_volume", "") or "")
+def is_post_ai_coupons_or_retail(tender_data: dict, ai: dict) -> bool:
     deliv = str(ai.get("delivery_mode_and_location", "") or "")
+    subj = str(ai.get("subject_grade_and_volume", "") or "")
+
+    lots = tender_data.get("lots") or []
+    ai_lots = ai.get("lots_analysis") or []
+    if len(lots) > 1 and ai_lots:
+        relevant_ai_lots = [
+            al for al in ai_lots
+            if al.get("is_bulk_relevant", True)
+            and not (
+                COUPON_CARD_REGEX.search(str(al.get("subject_grade_and_volume", "")))
+                and not BULK_KEYWORD_REGEX.search(f"{al.get('subject_grade_and_volume', '')} {deliv}")
+            )
+        ]
+        if not relevant_ai_lots:
+            return True
 
     if COUPON_CARD_REGEX.search(deliv) and not BULK_KEYWORD_REGEX.search(deliv):
         return True
-    if COUPON_CARD_REGEX.search(subj) and not BULK_KEYWORD_REGEX.search(f"{subj} {deliv}"):
+    if len(lots) <= 1 and COUPON_CARD_REGEX.search(subj) and not BULK_KEYWORD_REGEX.search(f"{subj} {deliv}"):
         return True
     return False
 
@@ -394,6 +546,27 @@ def format_percent_clean(val: float) -> str:
         return str(int(round(val)))
     return str(round(val, 2)).rstrip("0").rstrip(".")
 
+# Сопоставление ответа ИИ с конкретным лотом Prozorro
+def match_ai_lot_entry(lot_info: dict, idx: int, ai_lots: list, total_target_lots: int) -> dict:
+    if not ai_lots:
+        return {}
+    lot_id = lot_info["lotId"]
+    lot_lbl_low = lot_info["lotLabel"].lower().strip()
+
+    for al in ai_lots:
+        if str(al.get("lot_id", "")).strip() == lot_id and lot_id:
+            return al
+    for al in ai_lots:
+        al_lbl = str(al.get("lot_label", "")).lower().strip()
+        m1 = re.search(r"(\d+)", lot_lbl_low)
+        m2 = re.search(r"(\d+)", al_lbl)
+        if m1 and m2 and m1.group(1) == m2.group(1):
+            return al
+    if len(ai_lots) == total_target_lots and idx < len(ai_lots):
+        return ai_lots[idx]
+    return {}
+
+# Расчет бюджета и предмета закупки (как для однолотовых, так и для многолотовых тендеров с выводом каждого лота с новой строки)
 def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str, price_limited_flag: str) -> dict:
     val = tender_data.get("value", {})
     budget_raw = float(val.get("amount", 0) or 0)
@@ -402,45 +575,7 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
     ai_vat_rate = ai.get("vat_rate_percent", 20)
     is_zero_vat = (ai_vat_rate == 0) or bool(ZERO_VAT_REGEX.search(docs_text))
     vat_rate_num = 0 if is_zero_vat else 20
-
-    if is_zero_vat:
-        multiplier = 1.0
-        vat_label = "с НДС (ставка НДС: 0%)"
-    else:
-        multiplier = 1.0 if prozorro_vat_included else 1.2
-        vat_label = "с НДС (ставка НДС: 20%)"
-
-    items = tender_data.get("items", [])
-    fuel_items = [
-        i for i in items
-        if str(i.get("classification", {}).get("id", "")).startswith(TARGET_CPV_PREFIXES)
-        and not str(i.get("classification", {}).get("id", "")).startswith(EXCLUDED_CPV_PREFIXES)
-    ]
-    target_items = fuel_items if fuel_items else items
-    prozorro_items_count = len(target_items)
-    ai_spec_items_count = int(ai.get("items_count_in_specification", 1) or 1)
-
-    effective_items_count = max(prozorro_items_count, ai_spec_items_count)
-
-    single_qty = 0.0
-    unit_label = "ед."
-    is_single_item = False
-    base_display_num = 0.0
-
-    if effective_items_count == 1 and prozorro_items_count == 1:
-        single_qty = float(target_items[0].get("quantity", 0) or 0)
-        unit_label = normalize_unit_label(target_items[0].get("unit", {}).get("name", "ед."))
-
-        if single_qty > 0:
-            is_single_item = True
-            base_display_num = (budget_raw / single_qty) * multiplier
-            base_budget_str = f"{base_display_num:,.2f} грн/{unit_label} {vat_label}".replace(",", " ")
-        else:
-            base_display_num = budget_raw * multiplier
-            base_budget_str = f"{base_display_num:,.2f} грн {vat_label}".replace(",", " ")
-    else:
-        base_display_num = budget_raw * multiplier
-        base_budget_str = f"{base_display_num:,.2f} грн {vat_label}".replace(",", " ")
+    vat_label = "с НДС (ставка НДС: 0%)" if is_zero_vat else "с НДС (ставка НДС: 20%)"
 
     ai_policy = str(ai.get("over_budget_policy", "") or "").strip().upper()
     try:
@@ -460,6 +595,135 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
             ai_policy = "PROHIBITED_IN_TD"
 
     announcement_allows_over_budget = (price_limited_flag == "Ні") or (over_pct > 0 and price_limited_flag != "Так")
+
+    all_lots = tender_data.get("lots") or []
+    if len(all_lots) > 1:
+        target_lots = extract_target_lots_info(tender_data, include_closed=False)
+        ai_lots = ai.get("lots_analysis") or []
+
+        subj_html_lines = []
+        subj_sheet_lines = []
+        budg_html_lines = []
+        budg_sheet_lines = []
+
+        for idx, l_info in enumerate(target_lots):
+            al = match_ai_lot_entry(l_info, idx, ai_lots, len(target_lots))
+            if al and al.get("is_bulk_relevant") is False:
+                continue
+
+            raw_lot_subj = str(al.get("subject_grade_and_volume", "") or "").strip() if al else ""
+            if raw_lot_subj:
+                clean_lot_subj = strip_clause_references_for_card(raw_lot_subj, strip_cpv=True)
+                clean_lot_subj = LOT_PREFIX_STRIP_REGEX.sub("", clean_lot_subj).strip(" ,;.")
+                if COUPON_CARD_REGEX.search(clean_lot_subj) and not BULK_KEYWORD_REGEX.search(clean_lot_subj):
+                    continue
+            else:
+                clean_lot_subj = ""
+
+            if not clean_lot_subj:
+                clean_lot_subj = strip_clause_references_for_card(l_info["fallbackSubject"], strip_cpv=True)
+
+            lot_lbl = l_info["lotLabel"]
+            subj_html_lines.append(f"• <b>{html.escape(lot_lbl)}</b> — {html.escape(clean_lot_subj)}")
+            subj_sheet_lines.append(f"• {lot_lbl} — {clean_lot_subj}")
+
+            lot_multiplier = 1.0 if is_zero_vat else (1.0 if l_info["vatIncluded"] else 1.2)
+            ai_lot_items_cnt = int(al.get("items_count_in_lot", 1) or 1) if al else 1
+
+            # Если внутри лота 1 марка товара и известна единица объема — считаем цену за единицу по лоту
+            if ai_lot_items_cnt == 1 and l_info["sameUnitAcrossItems"] and l_info["totalQty"] > 0 and l_info["budgetRaw"] > 0:
+                is_lot_per_unit = True
+                lot_unit_lbl = l_info["unitLabel"]
+                lot_base_num = (l_info["budgetRaw"] / l_info["totalQty"]) * lot_multiplier
+                lot_base_str = f"{lot_base_num:,.2f} грн/{lot_unit_lbl} {vat_label}".replace(",", " ")
+            else:
+                is_lot_per_unit = False
+                lot_unit_lbl = l_info["unitLabel"]
+                lot_base_num = l_info["budgetRaw"] * lot_multiplier
+                lot_base_str = f"{lot_base_num:,.2f} грн {vat_label}".replace(",", " ")
+
+            if announcement_allows_over_budget and (over_pct > 0 or ai_policy == "ALLOWED_WITH_PERCENT"):
+                pct_clean = format_percent_clean(over_pct)
+                real_lot_val = lot_base_num * (1.0 + over_pct / 100.0)
+                if is_lot_per_unit:
+                    real_lot_str = f"{real_lot_val:,.2f} грн/{lot_unit_lbl} с НДС".replace(",", " ")
+                else:
+                    real_lot_str = f"{real_lot_val:,.2f} грн с НДС".replace(",", " ")
+                lot_base_str += (
+                    f". Есть возможность подачи предложений сверх бюджета на +{pct_clean}%, "
+                    f"то есть реальный бюджет лота {real_lot_str}"
+                )
+
+            budg_html_lines.append(f"• <b>{html.escape(lot_lbl)}</b> — {html.escape(lot_base_str)}")
+            budg_sheet_lines.append(f"• {lot_lbl} — {lot_base_str}")
+
+        if subj_html_lines and budg_html_lines:
+            general_over_note = ""
+            if announcement_allows_over_budget and not (over_pct > 0 or ai_policy == "ALLOWED_WITH_PERCENT"):
+                if ai_policy == "PROHIBITED_IN_TD" or bool(OVER_BUDGET_PROHIBITED_REGEX.search(docs_text or "")):
+                    general_over_note = (
+                        "Внимание! Объявлением предусмотрена возможность подачи предложений сверх бюджета, "
+                        "однако тендерной документацией эта возможность запрещена. Ошибка заказчика!"
+                    )
+                else:
+                    general_over_note = (
+                        "Предусмотрена возможность подачи предложений сверх бюджета, "
+                        "однако величина превышения бюджета в закупке не установлена."
+                    )
+
+            budget_card_html = "\n" + "\n".join(budg_html_lines)
+            budget_sheet_str = "\n" + "\n".join(budg_sheet_lines)
+            if general_over_note:
+                budget_card_html += f"\n<i>{html.escape(general_over_note)}</i>"
+                budget_sheet_str += f"\n{general_over_note}"
+
+            return {
+                "isMultiLot": True,
+                "relevantLotsCount": len(subj_html_lines),
+                "subjectCardHtml": "\n" + "\n".join(subj_html_lines),
+                "budgetCardHtml": budget_card_html,
+                "fuelSummary": "\n" + "\n".join(subj_sheet_lines),
+                "budgetDisplay": budget_sheet_str,
+                "isZeroVat": is_zero_vat,
+                "vatRatePercent": vat_rate_num,
+                "itemsCount": len(subj_html_lines),
+                "singleItemQty": 0.0,
+                "unitLabel": "литр"
+            }
+
+    # Стандартный расчет для однолотового тендера
+    multiplier = 1.0 if is_zero_vat else (1.0 if prozorro_vat_included else 1.2)
+    items = tender_data.get("items", [])
+    fuel_items = [
+        i for i in items
+        if str(i.get("classification", {}).get("id", "")).startswith(TARGET_CPV_PREFIXES)
+        and not str(i.get("classification", {}).get("id", "")).startswith(EXCLUDED_CPV_PREFIXES)
+    ]
+    target_items = fuel_items if fuel_items else items
+    prozorro_items_count = len(target_items)
+    ai_spec_items_count = int(ai.get("items_count_in_specification", 1) or 1)
+
+    units_set = {
+        normalize_unit_label((i.get("unit") or {}).get("name", "ед."))
+        for i in target_items
+    }
+    total_same_unit_qty = sum(float(i.get("quantity", 0) or 0) for i in target_items) if len(units_set) == 1 else 0.0
+
+    single_qty = 0.0
+    unit_label = "ед."
+    is_single_item = False
+    base_display_num = 0.0
+
+    if ai_spec_items_count == 1 and len(units_set) == 1 and total_same_unit_qty > 0:
+        single_qty = total_same_unit_qty
+        unit_label = next(iter(units_set))
+        is_single_item = True
+        base_display_num = (budget_raw / single_qty) * multiplier
+        base_budget_str = f"{base_display_num:,.2f} грн/{unit_label} {vat_label}".replace(",", " ")
+    else:
+        effective_items_count = max(prozorro_items_count, ai_spec_items_count)
+        base_display_num = budget_raw * multiplier
+        base_budget_str = f"{base_display_num:,.2f} грн {vat_label}".replace(",", " ")
 
     over_budget_suffix = ""
     if announcement_allows_over_budget:
@@ -486,11 +750,18 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
             )
 
     full_budget_str = base_budget_str + over_budget_suffix
+    subject_vol_clean = strip_clause_references_for_card(ai.get("subject_grade_and_volume", ""), strip_cpv=True)
+
     return {
+        "isMultiLot": False,
+        "relevantLotsCount": 1,
+        "subjectCardHtml": f" {html.escape(subject_vol_clean)}",
+        "budgetCardHtml": f" {html.escape(full_budget_str)}",
+        "fuelSummary": subject_vol_clean,
         "budgetDisplay": full_budget_str,
         "isZeroVat": is_zero_vat,
         "vatRatePercent": vat_rate_num,
-        "itemsCount": 1 if is_single_item else effective_items_count,
+        "itemsCount": 1 if is_single_item else max(prozorro_items_count, ai_spec_items_count),
         "singleItemQty": single_qty if is_single_item else 0.0,
         "unitLabel": unit_label
     }
@@ -538,7 +809,6 @@ def format_participant_price_with_vat(
         return f"{unit_price:,.2f} грн/{unit_label} {vat_label}".replace(",", " ")
     return f"{total_with_vat:,.2f} грн {vat_label}".replace(",", " ")
 
-# Приведение суммы или цены за единицу из карточки Договора Prozorro к цене с НДС по ставке из Google Таблицы
 def apply_sheet_vat_to_contract_amount(
     amount: float,
     val_vat_inc: bool,
@@ -557,7 +827,6 @@ def apply_sheet_vat_to_contract_amount(
     if not val_vat_inc:
         return amt * 1.2
 
-    # Если в карточке договора стоит флаг с НДС, проверяем, действительно ли заказчик начислил 20% НДС сверху
     if net > 0:
         if amt > net * 1.05:
             return amt
@@ -573,7 +842,6 @@ def apply_sheet_vat_to_contract_amount(
 
     return amt
 
-# Извлечение реальной даты заключения договора из модуля контрактов Prozorro (без заглушек)
 def extract_real_contract_date(c_full: dict, c_stub: dict, t_data: dict) -> str:
     candidates = [
         c_full.get("dateSigned"),
@@ -593,7 +861,6 @@ def extract_real_contract_date(c_full: dict, c_stub: dict, t_data: dict) -> str:
             return formatted
     return datetime.now(KYIV_TZ).strftime("%d.%m.%Y")
 
-# Извлечение номера договора из модуля контрактов Prozorro (или названия файла договора)
 def extract_contract_number_display(c_full: dict, c_stub: dict) -> str:
     raw_num = str(c_full.get("contractNumber") or c_stub.get("contractNumber") or "").strip()
 
@@ -616,7 +883,6 @@ def extract_contract_number_display(c_full: dict, c_stub: dict) -> str:
         return "б/н"
     return f"№ {clean_num}"
 
-# Полный сбор сведений о заключенном договоре (Победитель, Номер, Реальная дата, Цена за единицу с НДС из таблицы)
 def extract_signed_contract_summary(
     t_data: dict,
     c_full: dict,
@@ -627,6 +893,7 @@ def extract_signed_contract_summary(
     items_count: int,
     single_qty: float,
     unit_label: str,
+    lot_meta_by_id: dict = None,
     fallback_winner_name: str = ""
 ) -> dict:
     tender_vat_included = bool(t_data.get("value", {}).get("valueAddedTaxIncluded", False))
@@ -642,7 +909,17 @@ def extract_signed_contract_summary(
     if not matched_aw and active_awards:
         matched_aw = active_awards[-1]
 
-    # 1. Победитель и ЕГРПОУ
+    lot_id = str(matched_aw.get("lotID", "") or "")
+    lot_label = ""
+    if lot_id and lot_meta_by_id and lot_id in lot_meta_by_id:
+        lm = lot_meta_by_id[lot_id]
+        lot_label = lm["lotLabel"]
+        tender_vat_included = lm["vatIncluded"]
+        if lm["sameUnitAcrossItems"] and lm["totalQty"] > 0:
+            items_count = 1
+            single_qty = lm["totalQty"]
+            unit_label = lm["unitLabel"]
+
     c_suppliers = c_full.get("suppliers") or c_stub.get("suppliers") or []
     aw_suppliers = matched_aw.get("suppliers") or []
     supp = c_suppliers[0] if c_suppliers else (aw_suppliers[0] if aw_suppliers else {})
@@ -650,11 +927,9 @@ def extract_signed_contract_summary(
     win_name = str(supp.get("name") or fallback_winner_name or "Победитель определен").strip()
     win_edrpou = str((supp.get("identifier") or {}).get("id") or "").strip()
 
-    # 2. Номер и реальная дата заключения договора
     contract_number = extract_contract_number_display(c_full, c_stub)
     date_signed = extract_real_contract_date(c_full, c_stub, t_data)
 
-    # 3. Цена за единицу товара с НДС (ставка НДС берется строго из Google Таблицы)
     aw_val = matched_aw.get("value") or {}
     aw_amount = float(aw_val.get("amount", 0) or 0)
     aw_vat_inc = bool(aw_val.get("valueAddedTaxIncluded", False))
@@ -681,7 +956,6 @@ def extract_signed_contract_summary(
                 it_qty = float(it.get("quantity", 0) or single_qty or 0)
                 ref_unit_net = (aw_net_ref / it_qty) if (len(c_items) == 1 and it_qty > 0 and aw_net_ref > 0) else 0.0
 
-                # Если в самом договоре указаны и amount, и amountNet, проверяем реальное начисление НДС
                 u_with_vat = apply_sheet_vat_to_contract_amount(
                     u_amt_raw,
                     u_vat_inc,
@@ -734,6 +1008,7 @@ def extract_signed_contract_summary(
             unit_price_display = f"Указана в договоре ({vat_label})"
 
     return {
+        "lotLabel": lot_label,
         "winnerName": win_name,
         "winnerEdrpou": win_edrpou,
         "contractNumber": contract_number,
@@ -925,6 +1200,22 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
     lots_json = json.dumps(tender_data.get("lots", []), ensure_ascii=False)
     e_terms_json = json.dumps(tender_data.get("milestones", []), ensure_ascii=False)
 
+    target_lots_structured = extract_target_lots_info(tender_data, include_closed=False) if len(tender_data.get("lots") or []) > 1 else []
+    structured_lots_hint = json.dumps(
+        [
+            {
+                "lot_id": l["lotId"],
+                "lot_label": l["lotLabel"],
+                "lot_title": l["lotTitle"],
+                "lot_budget_uah": l["budgetRaw"],
+                "lot_vat_included": l["vatIncluded"],
+                "lot_items": l["itemsRaw"]
+            }
+            for l in target_lots_structured
+        ],
+        ensure_ascii=False
+    ) if target_lots_structured else "Закупка без деления на несколько лотов"
+
     prompt = f"""
     ПАСПОРТ ЗАКУПКИ ИЗ PROZORRO:
     ID закупки: {tender_data.get('tenderID', '')}
@@ -935,8 +1226,9 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
     Бюджет закупки в системе Prozorro: {budget_amount} UAH (флаг valueAddedTaxIncluded: {vat_included_flag})
     Тендерное обеспечение в паспорте Prozorro: {guarantee_amount} UAH
     Справка по законным срокам процедуры: {statutory_dates_hint}
-    Лоты объявления: {lots_json}
-    Номенклатура объявления: {items_json}
+    Структура активных топливных лотов (с привязанными позициями номенклатуры): {structured_lots_hint}
+    Лоты объявления (сырой JSON): {lots_json}
+    Номенклатура объявления (сырой JSON): {items_json}
     Электронные условия объявления Prozorro: {e_terms_json}
 
     ПОЛНЫЙ ТЕКСТ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ И ПРОЕКТА ДОГОВОРА:
@@ -952,17 +1244,22 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
             "1. Ищем ТОЛЬКО оптовые закупки БЕНЗИНА или ДИЗЕЛЬНОГО ТОПЛИВА НАЛИВОМ: "
             "автомобильным транспортом (бензовозами/автоцистернами или самовывозом) ИЛИ железнодорожным транспортом (вагон-цистернами).\n"
             "2. Если закупается авиатопливо (JET A-1, РТ, ТС-1), керосин (гас), газ, сжиженный газ, мазут или масла — СТРОГО верни is_relevant = false!\n"
-            "3. ЖЕСТКИЙ ОТСЕВ ТАЛОНОВ И АЗС: Если по условиям поставки или договора (например, п. 3.1 Договора или Технического задания) передача/отпуск товара осуществляется по талонам, топливным картам, скретч-картам, бланкам-разрешениям или путем заправки на сети АЗС (даже если в ТД формально упоминается оптовая лицензия или акцизный склад) — СТРОГО верни is_relevant = false!\n"
-            "4. ПОДСЧЕТ КОЛИЧЕСТВА ПОЗИЦИЙ ТОВАРА (items_count_in_specification): Посчитай, сколько отдельных позиций (наименований/марок топлива) закупается согласно Спецификации / Техническому заданию ТД. Например, если закупается только Дизельное топливо — укажи 1. Если закупается ДТ и Бензин А-95 (или несколько разных марок ДТ и бензина) — укажи точное число позиций (например, 2, 3, 4).\n"
-            "5. ПРОВЕРКА НДС (vat_rate_percent): Проверь проект договора и условия закупки. Если применяется ставка НДС 0% (ПДВ 0%, в т.ч. по Постановлению КМУ №178) — укажи vat_rate_percent = 0. Если стандартный НДС 20% — укажи vat_rate_percent = 20.\n"
-            "6. ПРОВЕРКА ПРЕВЫШЕНИЯ ОЖИДАЕМОЙ СТОИМОСТИ (over_budget_policy и over_budget_percent):\n"
-            "   - Если в ТД указан конкретный допустимый процент превышения ожидаемой стоимости ('Прийнятний відсоток перевищення ціни тендерної пропозиції над очікуваною вартістю становить не більше ніж X%'): установи over_budget_policy = 'ALLOWED_WITH_PERCENT' и over_budget_percent = X.\n"
-            "   - Если параметр объявления 'Ціна пропозиції обмежена очікуваною вартістю' равен 'Ні', но в тексте ТД заказчик ПРЯМО ЗАПРЕТИЛ подавать предложения выше ожидаемой стоимости: установи over_budget_policy = 'PROHIBITED_IN_TD' и over_budget_percent = 0.\n"
-            "   - Если параметр объявления равен 'Ні', но в ТД процент превышения не указан и запрета нет: установи over_budget_policy = 'UNSPECIFIED_IN_TD' и over_budget_percent = 0.\n"
-            "   - Во всех остальных случаях (когда цена ограничена ожидаемой стоимостью): установи over_budget_policy = 'LIMITED_BY_ANNOUNCEMENT' и over_budget_percent = 0.\n"
-            "7. КОМПАКТНОСТЬ ПОЛЕЙ КАРТОЧКИ (БЕЗ ССЫЛОК НА ПУНКТЫ И БЕЗ КОДА ДК): В полях для основной карточки (subject_grade_and_volume, payment_terms, delivery_mode_and_location, delivery_and_contract_term, bid_security_uah, contract_security_details) НЕ УКАЗЫВАЙ код ДК 021:2015 и НЕ УКАЗЫВАЙ ссылки на пункты договора, ТД или объявления (не пиши '(п. 3.4 Договора)', '(согласно Номенклатуре объявления)'). Пиши только чистую суть.\n"
-            "8. ССЫЛКИ НА ПУНКТЫ В ОСОБЕННОСТЯХ И ФОРМУЛЕ: В полях features_pitfalls_and_risks, features_price_increase_rules, features_penalties и final_formula_line ОБЯЗАТЕЛЬНО указывай ссылки на пункты Договора/ТД.\n"
-            "9. ВЫДЕЛЕНИЕ ЖИРНЫМ ДАТЫ ДОГОВОРА: В поле earliest_contract_date_calculation выдели ТОЛЬКО самую вероятную раннюю дату (или диапазон дат) заключения договора двойными звездочками **ДД.ММ.ГГГГ**, а промежуточные даты этапов (окончание подачи заявок, дата аукциона) оставляй обычным текстом без звездочек.\n"
+            "3. ЖЕСТКИЙ ОТСЕВ ТАЛОНОВ И АЗС: Если по условиям поставки или договора передача/отпуск товара осуществляется по талонам, топливным картам, скретч-картам, бланкам-разрешениям или путем заправки на сети АЗС — СТРОГО верни is_relevant = false!\n"
+            "4. МНОГОЛОТОВЫЕ ЗАКУПКИ (lots_analysis): Если в закупке несколько лотов, ОБЯЗАТЕЛЬНО заполни массив lots_analysis отдельно по каждому лоту из 'Структура активных топливных лотов':\n"
+            "   - передай точный lot_id и lot_label ('Лот 1', 'Лот 2');\n"
+            "   - укажи is_bulk_relevant = true, если этот лот является оптовой поставкой бензина/ДТ наливом (и false, если конкретно этот лот по ТД талонный/карточный/газ/масла);\n"
+            "   - укажи items_count_in_lot (1 — если в лоте закупается одна марка топлива, >1 — если внутри одного лота корзина из разных марок);\n"
+            "   - в subject_grade_and_volume каждого лота укажи наименование, точную марку топлива по ТД и объем ИМЕННО ЭТОГО ЛОТА (например: 'Дизельное топливо ДТ-З-Евро5-В0 (В7), 1 000 000 литров') БЕЗ слова 'Лот 1', БЕЗ кода ДК и БЕЗ ссылок на пункты ТД. Не суммируй объемы разных лотов в одну строку!\n"
+            "5. ПОДСЧЕТ КОЛИЧЕСТВА ПОЗИЦИЙ ТОВАРА (items_count_in_specification): Для однолотовой закупки укажи количество отдельных позиций (марок топлива) в Спецификации ТД (1 — если только один товар; >1 — если несколько разных марок).\n"
+            "6. ПРОВЕРКА НДС (vat_rate_percent): Если применяется ставка НДС 0% (ПДВ 0%, в т.ч. по Постановлению КМУ №178) — укажи vat_rate_percent = 0. Если стандартный НДС 20% — укажи vat_rate_percent = 20.\n"
+            "7. ПРОВЕРКА ПРЕВЫШЕНИЯ ОЖИДАЕМОЙ СТОИМОСТИ (over_budget_policy и over_budget_percent):\n"
+            "   - Если в ТД указан допустимый процент превышения ожидаемой стоимости ('не більше ніж X%'): over_budget_policy = 'ALLOWED_WITH_PERCENT', over_budget_percent = X.\n"
+            "   - Если параметр объявления равен 'Ні', но в ТД прямо запрещено подавать выше бюджета: over_budget_policy = 'PROHIBITED_IN_TD', over_budget_percent = 0.\n"
+            "   - Если параметр объявления равен 'Ні', а в ТД процент не указан и запрета нет: over_budget_policy = 'UNSPECIFIED_IN_TD', over_budget_percent = 0.\n"
+            "   - Иначе: over_budget_policy = 'LIMITED_BY_ANNOUNCEMENT', over_budget_percent = 0.\n"
+            "8. КОМПАКТНОСТЬ ПОЛЕЙ КАРТОЧКИ (БЕЗ ССЫЛОК НА ПУНКТЫ И БЕЗ КОДА ДК): В полях основной карточки (subject_grade_and_volume, lots_analysis, payment_terms, delivery_mode_and_location, delivery_and_contract_term, bid_security_uah, contract_security_details) НЕ УКАЗЫВАЙ код ДК 021:2015 и НЕ УКАЗЫВАЙ ссылки на пункты договора, ТД или объявления.\n"
+            "9. ССЫЛКИ НА ПУНКТЫ В ОСОБЕННОСТЯХ И ФОРМУЛЕ: В полях features_pitfalls_and_risks, features_price_increase_rules, features_penalties и final_formula_line ОБЯЗАТЕЛЬНО указывай ссылки на пункты Договора/ТД.\n"
+            "10. ВЫДЕЛЕНИЕ ЖИРНЫМ ДАТЫ ДОГОВОРА: В поле earliest_contract_date_calculation выдели ТОЛЬКО самую вероятную раннюю дату (или диапазон дат) заключения договора двойными звездочками **ДД.ММ.ГГГГ**.\n"
             "Все ответы формируй строго на русском языке без эмодзи."
         ),
         response_mime_type="application/json",
@@ -975,6 +1272,23 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
                 "over_budget_policy": {"type": "STRING"},
                 "over_budget_percent": {"type": "NUMBER"},
                 "subject_grade_and_volume": {"type": "STRING"},
+                "lots_analysis": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "lot_id": {"type": "STRING"},
+                            "lot_label": {"type": "STRING"},
+                            "is_bulk_relevant": {"type": "BOOLEAN"},
+                            "items_count_in_lot": {"type": "INTEGER"},
+                            "subject_grade_and_volume": {"type": "STRING"}
+                        },
+                        "required": [
+                            "lot_id", "lot_label", "is_bulk_relevant",
+                            "items_count_in_lot", "subject_grade_and_volume"
+                        ]
+                    }
+                },
                 "payment_terms": {"type": "STRING"},
                 "is_formula_pricing": {"type": "BOOLEAN"},
                 "preliminary_formula_line": {"type": "STRING"},
@@ -1002,7 +1316,8 @@ def analyze_tender_with_gemini(tender_data: dict, docs_text: str, pdf_parts: lis
             "required": [
                 "is_relevant", "items_count_in_specification", "vat_rate_percent",
                 "over_budget_policy", "over_budget_percent",
-                "subject_grade_and_volume", "payment_terms", "is_formula_pricing",
+                "subject_grade_and_volume", "lots_analysis",
+                "payment_terms", "is_formula_pricing",
                 "preliminary_formula_line", "final_formula_line", "formula_variables",
                 "delivery_mode_and_location", "delivery_and_contract_term",
                 "bid_security_uah", "contract_security_details",
@@ -1093,7 +1408,7 @@ def build_formatted_formula_html(ai: dict) -> str:
 
     return "\n\n".join(blocks) if blocks else html.escape(final_f or "Формула указана в проекте договора.")
 
-def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str, price_limited_flag: str):
+def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str, price_limited_flag: str) -> bool:
     tender_ua_id = tender_data.get("tenderID", "Не указан")
     entity = tender_data.get("procuringEntity", {})
     cust_name = entity.get("name", "Не указан")
@@ -1104,12 +1419,15 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str
     procedure_clean = PROCUREMENT_METHODS.get(method_type, "Открытые торги")
 
     pricing_meta = extract_pricing_meta_and_budget(tender_data, ai, docs_text, price_limited_flag)
+    if len(tender_data.get("lots") or []) > 1 and not pricing_meta.get("isMultiLot"):
+        return False
+
     budget_display_str = pricing_meta["budgetDisplay"]
+    subject_summary_str = pricing_meta["fuelSummary"]
 
     raw_end_date = tender_data.get("tenderPeriod", {}).get("endDate", "")
     deadline_formatted = format_deadline_strict(raw_end_date)
 
-    subject_vol_clean = strip_clause_references_for_card(ai.get("subject_grade_and_volume", ""), strip_cpv=True)
     payment_terms_clean = strip_clause_references_for_card(ai.get("payment_terms", ""))
     delivery_loc_clean = strip_clause_references_for_card(ai.get("delivery_mode_and_location", ""))
     delivery_term_clean = strip_clause_references_for_card(ai.get("delivery_and_contract_term", ""))
@@ -1133,8 +1451,8 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str
         f"<b>Тендер:</b> <code>{html.escape(tender_ua_id)}</code> ({html.escape(procedure_clean)})\n"
         f"-----------------------------------------\n"
         f"<b>{html.escape(customer_str)}</b>\n\n"
-        f"<b>1) Предмет закупки и объем:</b> {html.escape(subject_vol_clean)}\n\n"
-        f"<b>2) Бюджет закупки:</b> {html.escape(budget_display_str)}\n\n"
+        f"<b>1) Предмет закупки и объем:</b>{pricing_meta['subjectCardHtml']}\n\n"
+        f"<b>2) Бюджет закупки:</b>{pricing_meta['budgetCardHtml']}\n\n"
         f"<b>3) Условия оплаты:</b> {html.escape(payment_terms_clean)}\n\n"
         f"<b>4) Ценообразование:</b> {pricing_html}\n\n"
         f"<b>5) Срок подачи тендерного предложения:</b> до {html.escape(deadline_formatted)}\n\n"
@@ -1176,7 +1494,7 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str
             "itemsCount": pricing_meta["itemsCount"],
             "singleItemQty": pricing_meta["singleItemQty"],
             "unitLabel": pricing_meta["unitLabel"],
-            "fuelSummary": subject_vol_clean,
+            "fuelSummary": subject_summary_str,
             "deliveryAndTerms": f"{delivery_loc_clean} | Сроки: {delivery_term_clean}",
             "paymentAndGuarantees": (
                 f"Оплата: {payment_terms_clean} | "
@@ -1198,6 +1516,7 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str
 
     resp = http_session.post(GOOGLE_WEB_APP_URL, json=payload, timeout=25)
     print(f" -> Ответ Google Таблицы: {resp.text[:120]}")
+    return True
 
 def extract_participants_from_prozorro(
     t_data: dict,
@@ -1205,11 +1524,152 @@ def extract_participants_from_prozorro(
     items_count: int,
     single_qty: float,
     unit_label: str
-) -> tuple[list, int, float, str]:
+) -> tuple[list, int, float, str, dict]:
     awards = t_data.get("awards", []) or []
     bids = t_data.get("bids", []) or []
     tender_vat_included = bool(t_data.get("value", {}).get("valueAddedTaxIncluded", False))
 
+    all_lots = t_data.get("lots") or []
+    lot_meta_by_id = {}
+    if len(all_lots) > 1:
+        t_lots = extract_target_lots_info(t_data, include_closed=True)
+        lot_meta_by_id = {l["lotId"]: l for l in t_lots if l["lotId"]}
+
+    if lot_meta_by_id:
+        award_by_bid_lot = {}
+        award_by_edrpou_lot = {}
+        for aw in awards:
+            aw_status = aw.get("status", "")
+            bid_id = aw.get("bid_id", "")
+            lot_id = str(aw.get("lotID", "") or "")
+            supp = (aw.get("suppliers") or [{}])[0]
+            edrpou = str(supp.get("identifier", {}).get("id", ""))
+            has_24h = any(m.get("code") == "24h" for m in (aw.get("milestones") or []))
+
+            label = "▫️ Участник"
+            if aw_status == "active":
+                label = "🏆 Признан победителем (ожидается заключение договора)"
+            elif aw_status == "pending":
+                label = "⏱ На рассмотрении (дано 24 часа на исправление)" if has_24h else "⏳ На рассмотрении (оценка предложения заказчиком)"
+            elif aw_status == "unsuccessful":
+                label = "❌ Предложение отклонено"
+            elif aw_status == "cancelled":
+                label = "▫️ Решение отменено"
+
+            if bid_id and lot_id:
+                award_by_bid_lot[(bid_id, lot_id)] = label
+            if edrpou and lot_id:
+                award_by_edrpou_lot[(edrpou, lot_id)] = label
+
+        participants = []
+        if bids:
+            for idx, b in enumerate(bids, start=1):
+                if b.get("status", "active") not in ("active", "pending"):
+                    continue
+                tenderers = b.get("tenderers") or []
+                if tenderers:
+                    supp = tenderers[0]
+                    base_name = supp.get("name", f"Участник №{idx}")
+                    edrpou = str(supp.get("identifier", {}).get("id", "скрыт до конца аукциона"))
+                else:
+                    base_name = f"Участник №{idx} (скрыт до окончания аукциона)"
+                    edrpou = "скрыт"
+
+                bid_id = b.get("id", "")
+                for lv in (b.get("lotValues") or []):
+                    if lv.get("status", "active") not in ("active", "pending"):
+                        continue
+                    l_id = str(lv.get("relatedLot", "") or "")
+                    if l_id not in lot_meta_by_id:
+                        continue
+                    lm = lot_meta_by_id[l_id]
+                    l_lbl = lm["lotLabel"]
+                    l_items_cnt = 1 if (lm["sameUnitAcrossItems"] and lm["totalQty"] > 0) else max(lm["prozorroItemsCount"], 2)
+                    l_qty = lm["totalQty"] if l_items_cnt == 1 else 0.0
+                    l_unit = lm["unitLabel"]
+
+                    val = lv.get("value") or {}
+                    if val.get("amount") is not None:
+                        raw_amt = float(val.get("amount", 0) or 0)
+                        bid_vat_inc = bool(val.get("valueAddedTaxIncluded", False))
+                        price_formatted = format_participant_price_with_vat(
+                            raw_amt, bid_vat_inc, lm["vatIncluded"], vat_rate_percent, l_items_cnt, l_qty, l_unit
+                        )
+                    else:
+                        raw_amt = 999999999999.0 + idx
+                        price_formatted = "Стартовая цена скрыта Prozorro до завершения аукциона"
+
+                    st_label = (
+                        award_by_bid_lot.get((bid_id, l_id))
+                        or award_by_edrpou_lot.get((edrpou, l_id))
+                        or "▫️ Участник"
+                    )
+                    participants.append({
+                        "lotNum": lm["lotNum"],
+                        "rawAmount": raw_amt,
+                        "name": f"[{l_lbl}] {base_name}",
+                        "edrpou": edrpou,
+                        "priceFormatted": price_formatted,
+                        "statusLabel": st_label
+                    })
+
+        if not participants and awards:
+            seen_keys = set()
+            for aw in awards:
+                aw_status = aw.get("status", "")
+                if aw_status == "cancelled":
+                    continue
+                l_id = str(aw.get("lotID", "") or "")
+                if l_id not in lot_meta_by_id:
+                    continue
+                lm = lot_meta_by_id[l_id]
+                l_lbl = lm["lotLabel"]
+                l_items_cnt = 1 if (lm["sameUnitAcrossItems"] and lm["totalQty"] > 0) else max(lm["prozorroItemsCount"], 2)
+                l_qty = lm["totalQty"] if l_items_cnt == 1 else 0.0
+                l_unit = lm["unitLabel"]
+
+                supp = (aw.get("suppliers") or [{}])[0]
+                base_name = supp.get("name", "Не указано")
+                edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
+                val = aw.get("value") or {}
+                if val.get("amount") is None:
+                    continue
+                raw_amt = float(val.get("amount", 0) or 0)
+                bid_vat_inc = bool(val.get("valueAddedTaxIncluded", False))
+                has_24h = any(m.get("code") == "24h" for m in (aw.get("milestones") or []))
+
+                key = f"{l_id}_{edrpou}_{raw_amt}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                if aw_status == "active":
+                    st_label = "🏆 Признан победителем (ожидается заключение договора)"
+                elif aw_status == "pending":
+                    st_label = "⏱ На рассмотрении (дано 24 часа на исправление)" if has_24h else "⏳ На рассмотрении (оценка предложения заказчиком)"
+                elif aw_status == "unsuccessful":
+                    st_label = "❌ Предложение отклонено"
+                else:
+                    st_label = "▫️ Участник"
+
+                price_formatted = format_participant_price_with_vat(
+                    raw_amt, bid_vat_inc, lm["vatIncluded"], vat_rate_percent, l_items_cnt, l_qty, l_unit
+                )
+                participants.append({
+                    "lotNum": lm["lotNum"],
+                    "rawAmount": raw_amt,
+                    "name": f"[{l_lbl}] {base_name}",
+                    "edrpou": edrpou,
+                    "priceFormatted": price_formatted,
+                    "statusLabel": st_label
+                })
+
+        participants.sort(key=lambda x: (x.get("lotNum", 1), x["rawAmount"]))
+        all_per_unit = all(lm["sameUnitAcrossItems"] and lm["totalQty"] > 0 for lm in lot_meta_by_id.values())
+        header_items_count = 1 if all_per_unit else 2
+        return participants, header_items_count, single_qty, unit_label, lot_meta_by_id
+
+    # Стандартный разбор участников для однолотового тендера
     if items_count <= 0:
         items = t_data.get("items", [])
         fuel_items = [
@@ -1336,7 +1796,35 @@ def extract_participants_from_prozorro(
             })
 
     participants.sort(key=lambda x: x["rawAmount"])
-    return participants, items_count, single_qty, unit_label
+    return participants, items_count, single_qty, unit_label, {}
+
+def format_award_price_with_lot_context(
+    aw_obj: dict,
+    tender_vat_included: bool,
+    vat_rate_percent: int,
+    items_count: int,
+    single_qty: float,
+    unit_label: str,
+    lot_meta_by_id: dict
+) -> tuple[str, str]:
+    val = aw_obj.get("value") or {}
+    raw_amt = float(val.get("amount", 0) or 0)
+    bid_vat_inc = bool(val.get("valueAddedTaxIncluded", False))
+    lot_id = str(aw_obj.get("lotID", "") or "")
+
+    if lot_id and lot_meta_by_id and lot_id in lot_meta_by_id:
+        lm = lot_meta_by_id[lot_id]
+        l_cnt = 1 if (lm["sameUnitAcrossItems"] and lm["totalQty"] > 0) else max(lm["prozorroItemsCount"], 2)
+        l_qty = lm["totalQty"] if l_cnt == 1 else 0.0
+        price_str = format_participant_price_with_vat(
+            raw_amt, bid_vat_inc, lm["vatIncluded"], vat_rate_percent, l_cnt, l_qty, lm["unitLabel"]
+        )
+        return price_str, lm["lotLabel"]
+
+    price_str = format_participant_price_with_vat(
+        raw_amt, bid_vat_inc, tender_vat_included, vat_rate_percent, items_count, single_qty, unit_label
+    )
+    return price_str, ""
 
 def fetch_dasu_events_for_tenders(tracked_internal_ids: set) -> dict:
     dasu_by_tender = {}
@@ -1385,7 +1873,6 @@ def check_tracked_and_background_tenders():
         for item in tracked_list:
             tender_ua_id = item.get("tenderID", "")
             lookup_id = item.get("prozorroInternalId") or tender_ua_id
-            # Ставка НДС берется напрямую из Google Таблицы (0 токенов ИИ)
             vat_rate_percent = resolve_tracked_vat_rate(item)
             items_count = int(item.get("itemsCount", 0) or 0)
             single_qty = float(item.get("singleItemQty", 0) or 0)
@@ -1400,7 +1887,7 @@ def check_tracked_and_background_tenders():
             tender_vat_included = bool(t_data.get("value", {}).get("valueAddedTaxIncluded", False))
             awards = t_data.get("awards", []) or []
             contracts = t_data.get("contracts", []) or []
-            participants, items_count, single_qty, unit_label = extract_participants_from_prozorro(
+            participants, items_count, single_qty, unit_label, lot_meta_by_id = extract_participants_from_prozorro(
                 t_data, vat_rate_percent, items_count, single_qty, unit_label
             )
 
@@ -1464,20 +1951,33 @@ def check_tracked_and_background_tenders():
                     state_changed = True
 
             auc_start_iso = t_data.get("auctionPeriod", {}).get("startDate", "")
-            if not auc_start_iso and t_data.get("lots"):
+            auc_display_str = format_deadline_strict(auc_start_iso) if auc_start_iso else ""
+            if not auc_start_iso and lot_meta_by_id:
+                lot_auc_pairs = [
+                    (lm["lotLabel"], lm["auctionStartIso"])
+                    for lm in sorted(lot_meta_by_id.values(), key=lambda x: x["lotNum"])
+                    if lm["auctionStartIso"]
+                ]
+                if lot_auc_pairs:
+                    auc_start_iso = min(p[1] for p in lot_auc_pairs)
+                    auc_display_str = "; ".join(f"{lbl}: {format_deadline_strict(iso)}" for lbl, iso in lot_auc_pairs)
+            elif not auc_start_iso and t_data.get("lots"):
                 auc_start_iso = (t_data["lots"][0].get("auctionPeriod") or {}).get("startDate", "")
+                auc_display_str = format_deadline_strict(auc_start_iso) if auc_start_iso else ""
+
             auc_url = t_data.get("auctionUrl", "") or build_smarttender_url(tender_ua_id)
 
             if auc_start_iso:
-                if state.get("notifiedAuctionSet") != auc_start_iso:
+                auc_set_key = auc_display_str or auc_start_iso
+                if state.get("notifiedAuctionSet") != auc_set_key:
                     events_for_admin.append({
                         "title": "🔔 НАЗНАЧЕНО ВРЕМЯ ЭЛЕКТРОННОГО АУКЦИОНА",
                         "bodyHtml": (
-                            f"• <b>Дата и время старта аукциона:</b> <b>{html.escape(format_deadline_strict(auc_start_iso))}</b>\n"
+                            f"• <b>Дата и время старта аукциона:</b> <b>{html.escape(auc_display_str)}</b>\n"
                             f"• <b>Ссылка на вход в аукцион:</b> <a href=\"{html.escape(auc_url)}\">{html.escape(auc_url)}</a>"
                         )
                     })
-                    state["notifiedAuctionSet"] = auc_start_iso
+                    state["notifiedAuctionSet"] = auc_set_key
                     state_changed = True
 
                 dt_auc = parse_iso_dt(auc_start_iso)
@@ -1488,7 +1988,7 @@ def check_tracked_and_background_tenders():
                         events_for_admin.append({
                             "title": "🔔 НАПОМИНАНИЕ: ЧЕРЕЗ 1 ЧАС СТАРТ АУКЦИОНА",
                             "bodyHtml": (
-                                f"• <b>Старт аукциона:</b> <b>{html.escape(format_deadline_strict(auc_start_iso))}</b>\n"
+                                f"• <b>Старт аукциона:</b> <b>{html.escape(auc_display_str)}</b>\n"
                                 f"• <b>Ссылка на вход в аукцион:</b> <a href=\"{html.escape(auc_url)}\">{html.escape(auc_url)}</a>"
                             )
                         })
@@ -1496,12 +1996,11 @@ def check_tracked_and_background_tenders():
                         state_changed = True
 
             if t_status == "active.auction" and state.get("notifiedStage") != "stage_active_auction":
-                auc_time_str = format_deadline_strict(auc_start_iso) if auc_start_iso else "определяется системой Prozorro"
-                part_lines = []
-                for idx, p in enumerate(participants, start=1):
-                    part_lines.append(
-                        f"{idx}) <b>{html.escape(p['name'])}</b> — {html.escape(p['priceFormatted'])}"
-                    )
+                auc_time_str = auc_display_str if auc_display_str else "определяется системой Prozorro"
+                part_lines = [
+                    f"{idx}) <b>{html.escape(p['name'])}</b> — {html.escape(p['priceFormatted'])}"
+                    for idx, p in enumerate(participants, start=1)
+                ]
                 if not part_lines:
                     part_lines.append("<i>Список участников формируется системой Prozorro (названия скрыты до завершения аукциона).</i>")
 
@@ -1518,29 +2017,35 @@ def check_tracked_and_background_tenders():
                 state_changed = True
 
             rejected_seen = set(state.get("rejectedAwardsSeen") or [])
-            pending_awards = [a for a in awards if a.get("status") == "pending"]
-            active_awards = [a for a in awards if a.get("status") == "active"]
+            relevant_awards = [
+                a for a in awards
+                if not lot_meta_by_id or not a.get("lotID") or str(a.get("lotID")) in lot_meta_by_id
+            ]
+            pending_awards = [a for a in relevant_awards if a.get("status") == "pending"]
+            active_awards = [a for a in relevant_awards if a.get("status") == "active"]
 
-            for aw in awards:
+            for aw in relevant_awards:
                 aw_id = aw.get("id", "")
                 if aw.get("status") == "unsuccessful" and aw_id and aw_id not in rejected_seen:
                     supp = (aw.get("suppliers") or [{}])[0]
                     rej_name = supp.get("name", "Участник")
                     rej_edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
+                    aw_lot_id = str(aw.get("lotID", "") or "")
+                    lot_tag = f" ({lot_meta_by_id[aw_lot_id]['lotLabel']})" if (aw_lot_id and aw_lot_id in lot_meta_by_id) else ""
                     reason_summary = summarize_rejection_reason_with_gemini(tender_ua_id, rej_name, aw)
 
-                    if pending_awards:
-                        next_aw = pending_awards[-1]
+                    same_lot_pending = [
+                        pa for pa in pending_awards
+                        if not aw_lot_id or str(pa.get("lotID", "") or "") == aw_lot_id
+                    ]
+                    if same_lot_pending:
+                        next_aw = same_lot_pending[-1]
                         nsupp = (next_aw.get("suppliers") or [{}])[0]
                         next_name = nsupp.get("name", "Следующий участник")
                         next_edrpou = str(nsupp.get("identifier", {}).get("id", "Не указан"))
-                        nval = next_aw.get("value", {})
-                        next_price = format_participant_price_with_vat(
-                            float(nval.get("amount", 0) or 0),
-                            bool(nval.get("valueAddedTaxIncluded", False)),
-                            tender_vat_included,
-                            vat_rate_percent,
-                            items_count, single_qty, unit_label
+                        next_price, _ = format_award_price_with_lot_context(
+                            next_aw, tender_vat_included, vat_rate_percent,
+                            items_count, single_qty, unit_label, lot_meta_by_id
                         )
                         transition_line = (
                             f"<b>Право заключения договора (оценка предложения) перешло к следующему участнику:</b>\n"
@@ -1552,7 +2057,7 @@ def check_tracked_and_background_tenders():
                         transition_line = "<b>Дальнейший статус:</b> Ожидается публикация решения по следующему участнику."
 
                     events_for_all.append({
-                        "title": "⚠️ ВНИМАНИЕ! УЧАСТНИК ТОРГОВ ОТКЛОНЕН ЗАКАЗЧИКОМ",
+                        "title": f"⚠️ ВНИМАНИЕ! УЧАСТНИК ТОРГОВ ОТКЛОНЕН ЗАКАЗЧИКОМ{lot_tag}",
                         "bodyHtml": (
                             f"• <b>Отклоненный участник:</b> <b>{html.escape(rej_name)}</b> (ЕГРПОУ: {html.escape(rej_edrpou)})\n"
                             f"• <b>Причина отклонения:</b> <i>{html.escape(reason_summary)}</i>\n\n"
@@ -1563,44 +2068,42 @@ def check_tracked_and_background_tenders():
                     state["rejectedAwardsSeen"] = list(rejected_seen)
                     state_changed = True
 
-            if pending_awards:
-                cur_aw = pending_awards[-1]
+            seen_pending_ids = set(state.get("seenPendingAwardIds") or [])
+            for cur_aw in pending_awards:
                 cur_aw_id = cur_aw.get("id", "")
                 supp = (cur_aw.get("suppliers") or [{}])[0]
                 leader_name = supp.get("name", "Не указано")
                 leader_edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
-                val = cur_aw.get("value", {})
-                leader_price = format_participant_price_with_vat(
-                    float(val.get("amount", 0) or 0),
-                    bool(val.get("valueAddedTaxIncluded", False)),
-                    tender_vat_included,
-                    vat_rate_percent,
-                    items_count, single_qty, unit_label
+                leader_price, aw_lot_lbl = format_award_price_with_lot_context(
+                    cur_aw, tender_vat_included, vat_rate_percent,
+                    items_count, single_qty, unit_label, lot_meta_by_id
                 )
-
+                lot_suffix = f" ({aw_lot_lbl})" if aw_lot_lbl else ""
                 stage_key = f"pending_award_{cur_aw_id}"
-                new_menu_status = f"⏳ Оценка предложения заказчиком — рассматривается {leader_name} ({leader_price})"
-                if state.get("notifiedStage") != stage_key:
+                new_menu_status = f"⏳ Оценка предложения заказчиком{lot_suffix} — рассматривается {leader_name} ({leader_price})"
+
+                if cur_aw_id not in seen_pending_ids and state.get("notifiedStage") != stage_key:
                     events_for_all.append({
-                        "title": "📊 ОЦЕНКА ПРЕДЛОЖЕНИЙ (КВАЛИФИКАЦИЯ)",
+                        "title": f"📊 ОЦЕНКА ПРЕДЛОЖЕНИЙ (КВАЛИФИКАЦИЯ){lot_suffix}",
                         "bodyHtml": (
-                            f"• <b>Дальнейший статус закупки:</b> Оценка предложений заказчиком\n"
+                            f"• <b>Дальнейший статус закупки:</b> Оценка предложений заказчиком{html.escape(lot_suffix)}\n"
                             f"• <b>На рассмотрении сейчас находится предложение:</b> <b>{html.escape(leader_name)}</b> (ЕГРПОУ: {html.escape(leader_edrpou)}) — <b>{html.escape(leader_price)}</b>"
                         ),
                         "includeParticipants": True
                     })
+                    seen_pending_ids.add(cur_aw_id)
+                    state["seenPendingAwardIds"] = list(seen_pending_ids)
                     state["notifiedStage"] = stage_key
-                    state["liveMenuStatus"] = new_menu_status
-                    state_changed = True
-                elif state.get("liveMenuStatus") != new_menu_status:
                     state["liveMenuStatus"] = new_menu_status
                     state_changed = True
 
             seen_24h = set(state.get("seen24hIds") or [])
-            for aw in awards:
+            for aw in relevant_awards:
                 supp = (aw.get("suppliers") or [{}])[0]
                 p_name = supp.get("name", "Участник")
                 p_edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
+                aw_lot_id = str(aw.get("lotID", "") or "")
+                lot_suffix = f" ({lot_meta_by_id[aw_lot_id]['lotLabel']})" if (aw_lot_id and aw_lot_id in lot_meta_by_id) else ""
                 for ms in (aw.get("milestones") or []):
                     if ms.get("code") == "24h":
                         ms_id = ms.get("id") or f"{aw.get('id')}_{ms.get('dueDate')}"
@@ -1608,7 +2111,7 @@ def check_tracked_and_background_tenders():
                         desc_24h = ms.get("description", "Устранение несоответствий в документах тендерного предложения")
                         if ms_id not in seen_24h:
                             events_for_admin.append({
-                                "title": "⏱ ЗАКАЗЧИКОМ ДАНО 24 ЧАСА НА ИСПРАВЛЕНИЕ ОШИБОК",
+                                "title": f"⏱ ЗАКАЗЧИКОМ ДАНО 24 ЧАСА НА ИСПРАВЛЕНИЕ ОШИБОК{lot_suffix}",
                                 "bodyHtml": (
                                     f"• <b>Участник:</b> <b>{html.escape(p_name)}</b> (ЕГРПОУ: {html.escape(p_edrpou)})\n"
                                     f"• <b>Исправить недостатки в срок до:</b> <b>{html.escape(due_str)}</b>\n"
@@ -1618,30 +2121,28 @@ def check_tracked_and_background_tenders():
                             seen_24h.add(ms_id)
                             state["seen24hIds"] = list(seen_24h)
                             state["liveMenuStatus"] = (
-                                f"⏱ Оценка предложения {p_name} — заказчиком дано 24 часа на исправление недостатков "
+                                f"⏱ Оценка предложения {p_name}{lot_suffix} — заказчиком дано 24 часа на исправление недостатков "
                                 f"тендерного предложения в срок до {due_str}"
                             )
                             state_changed = True
 
-            if active_awards:
-                win_aw = active_awards[-1]
+            seen_active_award_ids = set(state.get("seenActiveAwardIds") or [])
+            for win_aw in active_awards:
                 win_aw_id = win_aw.get("id", "")
                 supp = (win_aw.get("suppliers") or [{}])[0]
                 win_name = supp.get("name", "Не указано")
                 win_edrpou = str(supp.get("identifier", {}).get("id", "Не указан"))
-                val = win_aw.get("value", {})
-                win_price = format_participant_price_with_vat(
-                    float(val.get("amount", 0) or 0),
-                    bool(val.get("valueAddedTaxIncluded", False)),
-                    tender_vat_included,
-                    vat_rate_percent,
-                    items_count, single_qty, unit_label
+                win_price, aw_lot_lbl = format_award_price_with_lot_context(
+                    win_aw, tender_vat_included, vat_rate_percent,
+                    items_count, single_qty, unit_label, lot_meta_by_id
                 )
+                lot_suffix = f" ({aw_lot_lbl})" if aw_lot_lbl else ""
                 stage_key = f"active_award_{win_aw_id}"
-                new_win_summary = f"{win_name} ({win_price})"
-                if state.get("notifiedStage") != stage_key:
+                new_win_summary = f"{aw_lot_lbl + ': ' if aw_lot_lbl else ''}{win_name} ({win_price})"
+
+                if win_aw_id not in seen_active_award_ids and state.get("notifiedStage") != stage_key:
                     events_for_all.append({
-                        "title": "🏆 ПРИНЯТО РЕШЕНИЕ О НАМЕРЕНИИ ЗАКЛЮЧИТЬ ДОГОВОР (АКЦЕПТ)",
+                        "title": f"🏆 ПРИНЯТО РЕШЕНИЕ О НАМЕРЕНИИ ЗАКЛЮЧИТЬ ДОГОВОР (АКЦЕПТ){lot_suffix}",
                         "bodyHtml": (
                             f"• <b>Победитель:</b> <b>{html.escape(win_name)}</b> (ЕГРПОУ: {html.escape(win_edrpou)})\n"
                             f"• <b>Ценовое предложение победителя:</b> <b>{html.escape(win_price)}</b>\n"
@@ -1650,67 +2151,86 @@ def check_tracked_and_background_tenders():
                         "includeParticipants": True,
                         "winnerSummary": new_win_summary
                     })
+                    seen_active_award_ids.add(win_aw_id)
+                    state["seenActiveAwardIds"] = list(seen_active_award_ids)
                     state["notifiedStage"] = stage_key
                     state["winnerName"] = win_name
                     state["winnerSummary"] = new_win_summary
-                    state["liveMenuStatus"] = f"🏆 {win_name} признан победителем ({win_price}) — ожидается заключение договора"
-                    state_changed = True
-                elif state.get("winnerSummary") != new_win_summary:
-                    state["winnerSummary"] = new_win_summary
-                    state["liveMenuStatus"] = f"🏆 {win_name} признан победителем ({win_price}) — ожидается заключение договора"
+                    state["liveMenuStatus"] = f"🏆 {win_name} признан победителем{lot_suffix} ({win_price}) — ожидается заключение договора"
                     state_changed = True
 
-            # 9. Заключение договора -> запрос полных данных контракта из /api/2.5/contracts/{id}, расчет цены с НДС из таблицы и автоочистка меню
             active_contracts = [c for c in contracts if c.get("status") == "active"]
-            if active_contracts or t_status == "complete":
-                c_stub = active_contracts[-1] if active_contracts else (contracts[-1] if contracts else {})
-                c_uuid = str(c_stub.get("id", "") or "")
-                c_full = fetch_contract_detail(c_uuid) if c_uuid else {}
+            seen_contract_ids = set(state.get("seenSignedContractIds") or [])
 
-                c_info = extract_signed_contract_summary(
-                    t_data=t_data,
-                    c_full=c_full,
-                    c_stub=c_stub,
-                    awards=awards,
-                    active_awards=active_awards,
-                    vat_rate_percent=vat_rate_percent,
-                    items_count=items_count,
-                    single_qty=single_qty,
-                    unit_label=unit_label,
-                    fallback_winner_name=state.get("winnerName", "")
+            if active_contracts or t_status == "complete":
+                contracts_to_process = active_contracts if active_contracts else ([contracts[-1]] if contracts else [{}])
+                all_lots_finished = (t_status == "complete") or (
+                    not lot_meta_by_id
+                    or all(lm["lotStatus"] in ("complete", "cancelled", "unsuccessful") for lm in lot_meta_by_id.values())
+                    or len(active_contracts) >= len([lm for lm in lot_meta_by_id.values() if lm["lotStatus"] not in ("cancelled", "unsuccessful")])
                 )
 
-                win_name = c_info["winnerName"]
-                win_edrpou = c_info["winnerEdrpou"]
-                contract_num = c_info["contractNumber"]
-                date_signed = c_info["contractDate"]
-                price_display = c_info["priceDisplay"]
-                price_label = "Цена за единицу товара" if c_info["isPerUnit"] else "Цена договора"
+                for idx_c, c_stub in enumerate(contracts_to_process):
+                    c_uuid = str(c_stub.get("id", "") or f"complete_{tender_ua_id}")
+                    if c_uuid in seen_contract_ids or (not lot_meta_by_id and state.get("notifiedStage") == "stage_contract_signed"):
+                        continue
 
-                winner_html = f"<b>{html.escape(win_name)}</b>"
-                if win_edrpou:
-                    winner_html += f" (ЕГРПОУ: {html.escape(win_edrpou)})"
+                    c_full = fetch_contract_detail(c_uuid) if c_stub.get("id") else {}
+                    c_info = extract_signed_contract_summary(
+                        t_data=t_data,
+                        c_full=c_full,
+                        c_stub=c_stub,
+                        awards=relevant_awards,
+                        active_awards=active_awards,
+                        vat_rate_percent=vat_rate_percent,
+                        items_count=items_count,
+                        single_qty=single_qty,
+                        unit_label=unit_label,
+                        lot_meta_by_id=lot_meta_by_id,
+                        fallback_winner_name=state.get("winnerName", "")
+                    )
 
-                contract_lines = [
-                    f"• <b>Победитель:</b> {winner_html}",
-                    f"• <b>{price_label}:</b> <b>{html.escape(price_display)}</b>",
-                ]
-                if contract_num:
-                    contract_lines.append(f"• <b>Номер договора:</b> {html.escape(contract_num)}")
-                contract_lines.append(f"• <b>Дата заключения договора:</b> {html.escape(date_signed)}")
+                    win_name = c_info["winnerName"]
+                    win_edrpou = c_info["winnerEdrpou"]
+                    contract_num = c_info["contractNumber"]
+                    date_signed = c_info["contractDate"]
+                    price_display = c_info["priceDisplay"]
+                    c_lot_lbl = c_info["lotLabel"]
+                    lot_suffix = f" ({c_lot_lbl})" if c_lot_lbl else ""
+                    price_label = "Цена за единицу товара" if c_info["isPerUnit"] else "Цена договора"
 
-                if state.get("notifiedStage") != "stage_contract_signed":
-                    events_for_all.append({
-                        "title": "🤝 ЗАКЛЮЧЕН ДОГОВОР ПО ТЕНДЕРУ",
+                    winner_html = f"<b>{html.escape(win_name)}</b>"
+                    if win_edrpou:
+                        winner_html += f" (ЕГРПОУ: {html.escape(win_edrpou)})"
+
+                    contract_lines = [
+                        f"• <b>Победитель:</b> {winner_html}",
+                        f"• <b>{price_label}:</b> <b>{html.escape(price_display)}</b>",
+                    ]
+                    if contract_num:
+                        contract_lines.append(f"• <b>Номер договора:</b> {html.escape(contract_num)}")
+                    contract_lines.append(f"• <b>Дата заключения договора:</b> {html.escape(date_signed)}")
+
+                    is_final_close = all_lots_finished and (idx_c == len(contracts_to_process) - 1)
+                    ev_obj = {
+                        "title": f"🤝 ЗАКЛЮЧЕН ДОГОВОР ПО ТЕНДЕРУ{lot_suffix}",
                         "hideBudget": True,
                         "bodyHtml": "\n".join(contract_lines),
-                        "footerHtml": "<b>Статус в меню:</b> Тендер завершен и автоматически убран из активного списка «Принимаем участие».",
-                        "closeParticipationMenu": "Договор заключен",
-                        "winnerName": f"{win_name} ({price_display})",
+                        "winnerName": f"{c_lot_lbl + ': ' if c_lot_lbl else ''}{win_name} ({price_display})",
                         "contractNumber": contract_num,
                         "contractDate": date_signed
-                    })
-                    state["notifiedStage"] = "stage_contract_signed"
+                    }
+                    if is_final_close:
+                        ev_obj["footerHtml"] = "<b>Статус в меню:</b> Тендер завершен и автоматически убран из активного списка «Принимаем участие»."
+                        ev_obj["closeParticipationMenu"] = "Договор заключен"
+                    else:
+                        ev_obj["footerHtml"] = "<b>Статус в меню:</b> Тендер остается на сопровождении в «Принимаем участие» по остальным активным лотам."
+
+                    events_for_all.append(ev_obj)
+                    seen_contract_ids.add(c_uuid)
+                    state["seenSignedContractIds"] = list(seen_contract_ids)
+                    if is_final_close:
+                        state["notifiedStage"] = "stage_contract_signed"
                     state["winnerName"] = win_name
                     state["contractNumber"] = contract_num
                     state["contractDate"] = date_signed
@@ -1769,7 +2289,7 @@ def check_tracked_and_background_tenders():
 
             seen_complaints = set(state.get("seenComplaints") or [])
             all_complaints = list(t_data.get("complaints") or [])
-            for aw in awards:
+            for aw in relevant_awards:
                 all_complaints.extend(aw.get("complaints") or [])
             for comp in all_complaints:
                 c_id = comp.get("id", "")
@@ -1988,10 +2508,13 @@ def evaluate_active_tenders(active_ids: list, gemini_budget_left: int) -> tuple[
             ai_verdict = analyze_tender_with_gemini(tender, docs_text, pdf_parts, price_limited_flag)
             gemini_used += 1
 
-            if ai_verdict.get("is_relevant") and not is_post_ai_coupons_or_retail(ai_verdict):
-                print(f" -> ПОДТВЕРЖДЕН НАЛИВ! Отправка в Google Sheets и Telegram: {tender_ua_id}")
-                dispatch_to_crm(tender, ai_verdict, docs_text, tender_url, price_limited_flag)
-                sent_to_crm += 1
+            if ai_verdict.get("is_relevant") and not is_post_ai_coupons_or_retail(tender, ai_verdict):
+                dispatched_ok = dispatch_to_crm(tender, ai_verdict, docs_text, tender_url, price_limited_flag)
+                if dispatched_ok:
+                    print(f" -> ПОДТВЕРЖДЕН НАЛИВ! Отправка в Google Sheets и Telegram: {tender_ua_id}")
+                    sent_to_crm += 1
+                else:
+                    print(f" -> Отклонен после полотовой сверки ТД: {tender_ua_id}")
             else:
                 print(f" -> Отклонен после чтения ТД (талоны/карты/АЗС или нецелевой товар): {tender_ua_id}")
 
