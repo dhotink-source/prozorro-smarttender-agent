@@ -224,7 +224,6 @@ def extract_lot_number_and_label(lot: dict, idx: int) -> tuple[int, str]:
         return num, f"Лот {num}"
     return idx, f"Лот {idx}"
 
-# Извлечение структуры целевых активных лотов из паспорта закупки Prozorro
 def extract_target_lots_info(tender_data: dict, include_closed: bool = False) -> list[dict]:
     all_lots = tender_data.get("lots") or []
     if not all_lots:
@@ -546,7 +545,6 @@ def format_percent_clean(val: float) -> str:
         return str(int(round(val)))
     return str(round(val, 2)).rstrip("0").rstrip(".")
 
-# Сопоставление ответа ИИ с конкретным лотом Prozorro
 def match_ai_lot_entry(lot_info: dict, idx: int, ai_lots: list, total_target_lots: int) -> dict:
     if not ai_lots:
         return {}
@@ -566,7 +564,6 @@ def match_ai_lot_entry(lot_info: dict, idx: int, ai_lots: list, total_target_lot
         return ai_lots[idx]
     return {}
 
-# Расчет бюджета и предмета закупки (как для однолотовых, так и для многолотовых тендеров с выводом каждого лота с новой строки)
 def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str, price_limited_flag: str) -> dict:
     val = tender_data.get("value", {})
     budget_raw = float(val.get("amount", 0) or 0)
@@ -630,7 +627,6 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
             lot_multiplier = 1.0 if is_zero_vat else (1.0 if l_info["vatIncluded"] else 1.2)
             ai_lot_items_cnt = int(al.get("items_count_in_lot", 1) or 1) if al else 1
 
-            # Если внутри лота 1 марка товара и известна единица объема — считаем цену за единицу по лоту
             if ai_lot_items_cnt == 1 and l_info["sameUnitAcrossItems"] and l_info["totalQty"] > 0 and l_info["budgetRaw"] > 0:
                 is_lot_per_unit = True
                 lot_unit_lbl = l_info["unitLabel"]
@@ -691,7 +687,6 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
                 "unitLabel": "литр"
             }
 
-    # Стандартный расчет для однолотового тендера
     multiplier = 1.0 if is_zero_vat else (1.0 if prozorro_vat_included else 1.2)
     items = tender_data.get("items", [])
     fuel_items = [
@@ -721,7 +716,6 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
         base_display_num = (budget_raw / single_qty) * multiplier
         base_budget_str = f"{base_display_num:,.2f} грн/{unit_label} {vat_label}".replace(",", " ")
     else:
-        effective_items_count = max(prozorro_items_count, ai_spec_items_count)
         base_display_num = budget_raw * multiplier
         base_budget_str = f"{base_display_num:,.2f} грн {vat_label}".replace(",", " ")
 
@@ -766,7 +760,6 @@ def extract_pricing_meta_and_budget(tender_data: dict, ai: dict, docs_text: str,
         "unitLabel": unit_label
     }
 
-# Определение ставки НДС строго по данным из Google Таблицы (0 токенов ИИ)
 def resolve_tracked_vat_rate(item: dict) -> int:
     vat_col = str(item.get("vatRateColumn", "") or item.get("vatRateDisplay", "")).strip()
     if vat_col in ("20%", "20"):
@@ -785,7 +778,6 @@ def resolve_tracked_vat_rate(item: dict) -> int:
 
     return 0 if item.get("isZeroVat") else 20
 
-# Форматирование цены участника на основе ставки НДС из Google Таблицы
 def format_participant_price_with_vat(
     raw_amount: float,
     bid_vat_included: bool,
@@ -1669,7 +1661,6 @@ def extract_participants_from_prozorro(
         header_items_count = 1 if all_per_unit else 2
         return participants, header_items_count, single_qty, unit_label, lot_meta_by_id
 
-    # Стандартный разбор участников для однолотового тендера
     if items_count <= 0:
         items = t_data.get("items", [])
         fuel_items = [
@@ -1980,20 +1971,9 @@ def check_tracked_and_background_tenders():
                 if dt_single_auc and dt_single_auc > now_utc:
                     upcoming_auc_isos.append((auc_start_iso, auc_display_str))
 
-            # Уведомление о назначенном времени аукциона и напоминание за 1 час отправляются
-            # строго ПО ИСТЕЧЕНИИ срока на подачу предложений (в статусе ожидания аукциона active.auction)
+            # Напоминание за 1 час до старта аукциона (без дублирующего уведомления о назначении времени)
             submission_deadline_passed = (dt_end is None) or (now_utc >= dt_end)
             if auc_start_iso and t_status == "active.auction" and submission_deadline_passed:
-                if upcoming_auc_isos:
-                    auc_set_key = auc_display_str or auc_start_iso
-                    if state.get("notifiedAuctionPostDeadline") != auc_set_key:
-                        events_for_admin.append({
-                            "title": "🔔 НАЗНАЧЕНО ВРЕМЯ ЭЛЕКТРОННОГО АУКЦИОНА",
-                            "bodyHtml": f"• <b>Дата и время старта аукциона:</b> <b>{html.escape(auc_display_str)}</b>"
-                        })
-                        state["notifiedAuctionPostDeadline"] = auc_set_key
-                        state_changed = True
-
                 seen_1h_keys = set(state.get("notifiedAuction1hList") or [])
                 if state.get("notifiedAuction1h"):
                     seen_1h_keys.add(state["notifiedAuction1h"])
@@ -2017,7 +1997,10 @@ def check_tracked_and_background_tenders():
                     state["notifiedAuction1hList"] = list(seen_1h_keys)
                     state_changed = True
 
-            if t_status == "active.auction" and state.get("notifiedStage") != "stage_active_auction":
+            # Единое уведомление по завершении приема заявок -> уходит через events_for_all и админу, и руководителям
+            mins_since_end = ((now_utc - dt_end).total_seconds() / 60.0) if dt_end else 999.0
+            ready_to_notify_auction_stage = bool(auc_display_str) or (mins_since_end >= 25.0)
+            if t_status == "active.auction" and state.get("notifiedStage") != "stage_active_auction" and ready_to_notify_auction_stage:
                 auc_time_str = auc_display_str if auc_display_str else "определяется системой Prozorro"
                 part_lines = [
                     f"{idx}) <b>{html.escape(p['name'])}</b> — {html.escape(p['priceFormatted'])}"
@@ -2311,7 +2294,7 @@ def check_tracked_and_background_tenders():
 
             seen_complaints = set(state.get("seenComplaints") or [])
             all_complaints = list(t_data.get("complaints") or [])
-            for aw in relevant_awards:
+            for aw in awards:
                 all_complaints.extend(aw.get("complaints") or [])
             for comp in all_complaints:
                 c_id = comp.get("id", "")
