@@ -51,6 +51,10 @@ GEMINI_MODELS_FALLBACK = (
     "gemini-2.5-flash",
 )
 
+IGNORED_SYSTEM_DOC_EXTENSIONS = (
+    ".p7s", ".sig", ".asic", ".asice", ".yaml", ".yml", ".json", ".xml"
+)
+
 EXCLUDED_FUEL_REGEX = re.compile(
     r"(\bгас\b|\bгасу\b|гасов[еоиій]|газ\b|\bгазу\b|газов[еоиій]|скраплен|пропан|бутан|метан|"
     r"авіаційн|реактивн|газотурбін|jet\s*a|джет|\bрт\b|\bтс-?1\b|мазут|олив[аи]|мастил|пічн[ео]\s+палив)",
@@ -191,6 +195,23 @@ def get_total_processed_count() -> int:
     cursor.execute("SELECT COUNT(*) FROM tenders")
     row = cursor.fetchone()
     return int(row[0]) if row else 0
+
+# Отсев системных файлов Prozorro (логов аукциона audit_*.yaml, подписей КЭП, выгрузок ботов)
+def is_customer_tender_document(d: dict) -> bool:
+    if not d or not d.get("id"):
+        return False
+    if d.get("documentOf") not in ("tender", "lot", "item"):
+        return False
+    author = str(d.get("author", "") or "").strip().lower()
+    if author and author != "tender_owner":
+        return False
+    title = str(d.get("title", "") or "").strip()
+    low_title = title.lower()
+    if not low_title or low_title.endswith(IGNORED_SYSTEM_DOC_EXTENSIONS):
+        return False
+    if low_title.startswith("audit_"):
+        return False
+    return True
 
 def normalize_unit_label(unit_raw: str) -> str:
     u = str(unit_raw or "ед.").strip().lower()
@@ -1120,7 +1141,7 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
     valid_docs = []
     for d in latest_docs.values():
         title = d.get("title", "").lower()
-        if title.endswith((".p7s", ".asic", ".sig", ".asice")):
+        if title.endswith(IGNORED_SYSTEM_DOC_EXTENSIONS) or title.startswith("audit_"):
             continue
         valid_docs.append(d)
 
@@ -1162,7 +1183,7 @@ def extract_all_attachments(documents_json: list) -> tuple[str, list]:
                 with zipfile.ZipFile(io.BytesIO(content)) as zf:
                     for inner_name in zf.namelist()[:8]:
                         low_inner = inner_name.lower()
-                        if low_inner.endswith((".p7s", ".sig")):
+                        if low_inner.endswith(IGNORED_SYSTEM_DOC_EXTENSIONS):
                             continue
                         inner_bytes = zf.read(inner_name)
                         if low_inner.endswith(".docx"):
@@ -1467,7 +1488,7 @@ def dispatch_to_crm(tender_data: dict, ai: dict, docs_text: str, tender_url: str
     doc_snapshot = {
         d.get("id"): f"{d.get('title', '')}|{d.get('dateModified', '')}"
         for d in (tender_data.get("documents") or [])
-        if d.get("id") and not str(d.get("title", "")).lower().endswith((".p7s", ".sig", ".asic", ".asice"))
+        if is_customer_tender_document(d)
     }
 
     payload = {
@@ -1889,8 +1910,7 @@ def check_tracked_and_background_tenders():
             cur_docs = {
                 d.get("id"): f"{d.get('title', '')}|{d.get('dateModified', '')}"
                 for d in (t_data.get("documents") or [])
-                if d.get("id") and d.get("documentOf") in ("tender", "lot", "item")
-                and not str(d.get("title", "")).lower().endswith((".p7s", ".sig", ".asic", ".asice"))
+                if is_customer_tender_document(d)
             }
             old_docs = state.get("docSnapshot") or {}
             new_end_iso = t_data.get("tenderPeriod", {}).get("endDate", "")
@@ -1898,34 +1918,36 @@ def check_tracked_and_background_tenders():
             new_budget_raw = float(t_data.get("value", {}).get("amount", 0) or 0)
             old_budget_raw = float(state.get("rawBudgetAmount", 0) or 0)
 
-            changes_desc = []
-            if old_docs:
-                for d_id, d_val in cur_docs.items():
-                    title_part = d_val.split("|")[0]
-                    if d_id not in old_docs:
-                        changes_desc.append(f"• Загружен новый файл: <b>{html.escape(title_part)}</b>")
-                    elif old_docs[d_id] != d_val:
-                        changes_desc.append(f"• Обновлен файл: <b>{html.escape(title_part)}</b>")
-            if old_end_iso and new_end_iso and old_end_iso != new_end_iso:
-                changes_desc.append(f"• Изменен срок подачи предложений: <b>до {html.escape(format_deadline_strict(new_end_iso))}</b>")
-            if old_budget_raw > 0 and new_budget_raw > 0 and abs(new_budget_raw - old_budget_raw) > 1:
-                changes_desc.append(f"• Изменен бюджет закупки: <b>{new_budget_raw:,.2f} грн</b>".replace(",", " "))
+            # Уведомление об изменениях ТД/сроков/бюджета проверяется только пока открыт период уточнений или подачи предложений
+            if t_status in ("active.enquiries", "active.tendering"):
+                changes_desc = []
+                if old_docs:
+                    for d_id, d_val in cur_docs.items():
+                        title_part = d_val.split("|")[0]
+                        if d_id not in old_docs:
+                            changes_desc.append(f"• Загружен новый файл: <b>{html.escape(title_part)}</b>")
+                        elif old_docs[d_id] != d_val:
+                            changes_desc.append(f"• Обновлен файл: <b>{html.escape(title_part)}</b>")
+                if old_end_iso and new_end_iso and old_end_iso != new_end_iso:
+                    changes_desc.append(f"• Изменен срок подачи предложений: <b>до {html.escape(format_deadline_strict(new_end_iso))}</b>")
+                if old_budget_raw > 0 and new_budget_raw > 0 and abs(new_budget_raw - old_budget_raw) > 1:
+                    changes_desc.append(f"• Изменен бюджет закупки: <b>{new_budget_raw:,.2f} грн</b>".replace(",", " "))
 
-            if changes_desc:
-                events_for_all.append({
-                    "title": "📝 ЗАКАЗЧИК ВНЕС ИЗМЕНЕНИЯ В ТЕНДЕР",
-                    "bodyHtml": "\n".join(changes_desc),
-                    "newDeadlineFormatted": format_deadline_strict(new_end_iso) if new_end_iso else ""
-                })
-                state["docSnapshot"] = cur_docs
-                state["deadlineIso"] = new_end_iso
-                state["rawBudgetAmount"] = new_budget_raw
-                state_changed = True
-            elif not old_docs:
-                state["docSnapshot"] = cur_docs
-                state["deadlineIso"] = new_end_iso
-                state["rawBudgetAmount"] = new_budget_raw
-                state_changed = True
+                if changes_desc:
+                    events_for_all.append({
+                        "title": "📝 ЗАКАЗЧИК ВНЕС ИЗМЕНЕНИЯ В ТЕНДЕР",
+                        "bodyHtml": "\n".join(changes_desc),
+                        "newDeadlineFormatted": format_deadline_strict(new_end_iso) if new_end_iso else ""
+                    })
+                    state["docSnapshot"] = cur_docs
+                    state["deadlineIso"] = new_end_iso
+                    state["rawBudgetAmount"] = new_budget_raw
+                    state_changed = True
+                elif not old_docs:
+                    state["docSnapshot"] = cur_docs
+                    state["deadlineIso"] = new_end_iso
+                    state["rawBudgetAmount"] = new_budget_raw
+                    state_changed = True
 
             dt_end = parse_iso_dt(new_end_iso)
             if dt_end and t_status in ("active.enquiries", "active.tendering"):
@@ -1971,7 +1993,7 @@ def check_tracked_and_background_tenders():
                 if dt_single_auc and dt_single_auc > now_utc:
                     upcoming_auc_isos.append((auc_start_iso, auc_display_str))
 
-            # Напоминание за 1 час до старта аукциона (без дублирующего уведомления о назначении времени)
+            # Напоминание за 1 час до старта аукциона
             submission_deadline_passed = (dt_end is None) or (now_utc >= dt_end)
             if auc_start_iso and t_status == "active.auction" and submission_deadline_passed:
                 seen_1h_keys = set(state.get("notifiedAuction1hList") or [])
@@ -2294,7 +2316,7 @@ def check_tracked_and_background_tenders():
 
             seen_complaints = set(state.get("seenComplaints") or [])
             all_complaints = list(t_data.get("complaints") or [])
-            for aw in awards:
+            for aw in relevant_awards:
                 all_complaints.extend(aw.get("complaints") or [])
             for comp in all_complaints:
                 c_id = comp.get("id", "")
